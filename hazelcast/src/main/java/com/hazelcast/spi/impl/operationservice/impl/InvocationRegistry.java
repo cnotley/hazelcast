@@ -17,6 +17,7 @@
 package com.hazelcast.spi.impl.operationservice.impl;
 
 import com.hazelcast.client.impl.operations.OperationFactoryWrapper;
+import com.hazelcast.cluster.Address;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.core.HazelcastOverloadException;
 import com.hazelcast.core.MemberLeftException;
@@ -80,12 +81,15 @@ public class InvocationRegistry implements Iterable<Invocation>, StaticMetricsPr
     private final ILogger logger;
     private final CallIdSequence callIdSequence;
     private final boolean profilerEnabled;
+    private final PerTargetInvocationTracker perTargetTracker;
     private final ConcurrentMap<Class, LatencyDistribution> latencyDistributions = new ConcurrentHashMap<>();
     private volatile boolean alive = true;
 
-    public InvocationRegistry(ILogger logger, CallIdSequence callIdSequence, HazelcastProperties properties) {
+    public InvocationRegistry(ILogger logger, CallIdSequence callIdSequence, HazelcastProperties properties,
+                              PerTargetInvocationTracker perTargetTracker) {
         this.logger = logger;
         this.callIdSequence = callIdSequence;
+        this.perTargetTracker = perTargetTracker;
 
         int coreSize = RuntimeAvailableProcessors.get();
         boolean reallyMultiCore = coreSize >= CORE_SIZE_CHECK;
@@ -122,11 +126,14 @@ public class InvocationRegistry implements Iterable<Invocation>, StaticMetricsPr
      * @return {@code false} when InvocationRegistry is not alive and registration is not successful, {@code true} otherwise
      */
     public boolean register(Invocation invocation) {
+        Address target = invocation.getTargetAddress();
+        perTargetTracker.tryAcquire(target);
         final long callId;
         boolean force = invocation.op.isUrgent() || invocation.isRetryCandidate();
         try {
             callId = force ? callIdSequence.forceNext() : callIdSequence.next();
         } catch (HazelcastOverloadException e) {
+            perTargetTracker.release(target);
             throw new HazelcastOverloadException("Failed to start invocation due to overload: " + invocation, e);
         }
         try {
@@ -134,10 +141,12 @@ public class InvocationRegistry implements Iterable<Invocation>, StaticMetricsPr
             setCallId(invocation.op, callId);
         } catch (IllegalStateException e) {
             callIdSequence.complete();
+            perTargetTracker.release(target);
             throw e;
         }
         invocations.put(callId, invocation);
         if (!alive) {
+            perTargetTracker.release(target);
             invocation.notifyError(new HazelcastInstanceNotActiveException());
             return false;
         }
@@ -156,6 +165,7 @@ public class InvocationRegistry implements Iterable<Invocation>, StaticMetricsPr
             return false;
         }
         invocations.remove(invocation.op.getCallId());
+        perTargetTracker.release(invocation.getTargetAddress());
         callIdSequence.complete();
         return true;
     }

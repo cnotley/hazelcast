@@ -170,10 +170,14 @@ public final class OperationServiceImpl implements StaticMetricsProvider, LiveOp
         this.outboundResponseHandler = new OutboundResponseHandler(thisAddress, serializationService,
                 node.getLogger(OutboundResponseHandler.class));
 
+        PerTargetInvocationTracker perTargetTracker = new PerTargetInvocationTracker(properties);
+        nodeEngine.getMetricsRegistry().registerDynamicMetricsProvider(perTargetTracker);
+
         this.invocationRegistry = new InvocationRegistry(
                 node.getLogger(OperationServiceImpl.class),
                 backpressureRegulator.newCallIdSequence(nodeEngine.getConcurrencyDetection()),
-                properties);
+                properties,
+                perTargetTracker);
 
         this.invocationMonitor = new InvocationMonitor(
                 nodeEngine, thisAddress, properties, invocationRegistry,

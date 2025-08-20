@@ -1441,6 +1441,22 @@ public final class ClusterProperty {
             = new HazelcastProperty("hazelcast.backpressure.max.concurrent.invocations.per.partition", 100);
 
     /**
+     * The maximum number of concurrent invocations targeting a single member.
+     * <p>
+     * This setting adds a per-target constraint on top of the global
+     * invocation limit to prevent a single member from being overwhelmed by
+     * another member. When the limit is hit, the caller blocks up to the
+     * configured {@link #BACKPRESSURE_BACKOFF_TIMEOUT_MILLIS}. If the timeout
+     * elapses, the invocation fails with
+     * {@link com.hazelcast.core.HazelcastOverloadException}.
+     * <p>
+     * The value must be greater than or equal to {@code 0}. A value of
+     * {@code 0} disables the per-target limit. The default is {@code 0}.
+     */
+    public static final HazelcastProperty BACKPRESSURE_MAX_CONCURRENT_INVOCATIONS_PER_TARGET
+            = new HazelcastProperty("hazelcast.backpressure.max.concurrent.invocations.per.target", 0);
+
+    /**
      * Hazelcast allows read operations to be performed while a partition is
      * being migrated. This can lead to stale reads for some scenarios. You can
      * disable stale read operations by setting this system property’s value to

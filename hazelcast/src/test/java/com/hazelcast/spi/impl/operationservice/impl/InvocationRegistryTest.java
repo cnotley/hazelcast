@@ -23,6 +23,7 @@ import com.hazelcast.logging.ILogger;
 import com.hazelcast.spi.impl.operationservice.Operation;
 import com.hazelcast.spi.impl.operationservice.impl.Invocation.Context;
 import com.hazelcast.spi.impl.sequence.CallIdSequenceWithBackpressure;
+import com.hazelcast.spi.impl.operationservice.impl.PerTargetInvocationTracker;
 import com.hazelcast.spi.properties.HazelcastProperties;
 import com.hazelcast.test.HazelcastSerialClassRunner;
 import com.hazelcast.test.HazelcastTestSupport;
@@ -55,7 +56,8 @@ public class InvocationRegistryTest extends HazelcastTestSupport {
         int capacity = 2;
         CallIdSequenceWithBackpressure callIdSequence = new CallIdSequenceWithBackpressure(capacity, 1000, ConcurrencyDetection.createDisabled());
         HazelcastProperties properties = new HazelcastProperties(new Properties());
-        invocationRegistry = new InvocationRegistry(logger, callIdSequence, properties);
+        PerTargetInvocationTracker tracker = new PerTargetInvocationTracker(properties);
+        invocationRegistry = new InvocationRegistry(logger, callIdSequence, properties, tracker);
     }
 
     private Invocation newInvocation() {
