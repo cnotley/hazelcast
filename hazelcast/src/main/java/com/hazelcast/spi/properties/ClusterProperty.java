@@ -1613,6 +1613,13 @@ public final class ClusterProperty {
             = new HazelcastProperty("hazelcast.event.sync.timeout.millis", 5000, MILLISECONDS);
 
     /**
+     * The maximum number of concurrently in-flight publish operations allowed per topic.
+     * A value of {@code 0} means unlimited concurrency.
+     */
+    public static final HazelcastProperty TOPIC_MAX_CONCURRENT_PUBLISHES
+            = new HazelcastProperty("hazelcast.topic.max.concurrent.publishes", 0);
+
+    /**
      * Enable or disable the sending of phone home data to Hazelcast’s phone home
      * server.
      */

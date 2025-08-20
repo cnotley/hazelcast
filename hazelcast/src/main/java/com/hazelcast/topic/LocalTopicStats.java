@@ -45,4 +45,18 @@ public interface LocalTopicStats extends LocalInstanceStats {
      * @return total number of received messages of this topic on this member
      */
     long getReceiveOperationCount();
+
+    /**
+     * Returns the number of publish operations that were rejected due to the configured concurrency limit.
+     *
+     * @return number of rejected publishes
+     */
+    long getRejectedPublishOperationCount();
+
+    /**
+     * Returns the number of publish operations currently in-flight for this topic.
+     *
+     * @return number of in-flight publishes
+     */
+    long getInFlightPublishOperationCount();
 }

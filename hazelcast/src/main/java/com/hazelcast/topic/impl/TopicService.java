@@ -20,6 +20,8 @@ import com.hazelcast.cluster.Address;
 import com.hazelcast.cluster.impl.MemberImpl;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.TopicConfig;
+import com.hazelcast.cluster.MembershipEvent;
+import com.hazelcast.cluster.MembershipListener;
 import com.hazelcast.internal.cluster.ClusterService;
 import com.hazelcast.internal.metrics.DynamicMetricsProvider;
 import com.hazelcast.internal.metrics.MetricDescriptor;
@@ -33,11 +35,13 @@ import com.hazelcast.internal.services.StatisticsAwareService;
 import com.hazelcast.internal.util.ConstructorFunction;
 import com.hazelcast.internal.util.HashUtil;
 import com.hazelcast.internal.util.MapUtil;
+import com.hazelcast.internal.util.executor.StripedRunnable;
 import com.hazelcast.spi.impl.NodeEngine;
 import com.hazelcast.spi.impl.eventservice.EventPublishingService;
 import com.hazelcast.spi.impl.eventservice.EventRegistration;
 import com.hazelcast.spi.impl.eventservice.EventService;
 import com.hazelcast.spi.properties.ClusterProperty;
+import com.hazelcast.topic.TopicOverloadException;
 import com.hazelcast.topic.ITopic;
 import com.hazelcast.topic.LocalTopicStats;
 import com.hazelcast.topic.Message;
@@ -61,7 +65,8 @@ import static com.hazelcast.internal.util.ConcurrencyUtil.CALLER_RUNS;
 import static com.hazelcast.internal.util.ConcurrencyUtil.getOrPutSynchronized;
 
 public class TopicService implements ManagedService, RemoteService, EventPublishingService,
-                                     StatisticsAwareService<LocalTopicStats>, DynamicMetricsProvider {
+                                     StatisticsAwareService<LocalTopicStats>, DynamicMetricsProvider,
+                                     MembershipListener {
 
     public static final String SERVICE_NAME = "hz:impl:topicService";
 
@@ -76,6 +81,7 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     private EventService eventService;
     private final AtomicInteger counter = new AtomicInteger();
     private Address localAddress;
+    private final ConcurrentMap<String, TopicPublishLimiter> limiterMap = new ConcurrentHashMap<>();
 
     @Override
     public void init(NodeEngine nodeEngine, Properties properties) {
@@ -85,6 +91,12 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
             orderingLocks[i] = new ReentrantLock();
         }
         eventService = nodeEngine.getEventService();
+
+        // initialize publish limiters for existing topic configurations
+        for (TopicConfig topicConfig : nodeEngine.getConfig().getTopicConfigs().values()) {
+            ensureLimiter(topicConfig.getName(), topicConfig);
+        }
+        nodeEngine.getClusterService().addMembershipListener(this);
 
         boolean dsMetricsEnabled = nodeEngine.getProperties().getBoolean(ClusterProperty.METRICS_DATASTRUCTURES);
         if (dsMetricsEnabled) {
@@ -120,6 +132,7 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     @Override
     public ITopic createDistributedObject(String name, UUID source, boolean local) {
         TopicConfig topicConfig = nodeEngine.getConfig().findTopicConfig(name);
+        ensureLimiter(name, topicConfig);
 
         if (topicConfig.isGlobalOrderingEnabled()) {
             return new TotalOrderedTopicProxy(name, nodeEngine, this);
@@ -156,6 +169,29 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
         return getOrPutSynchronized(statsMap, name, statsMap, localTopicStatsConstructorFunction);
     }
 
+    private TopicPublishLimiter ensureLimiter(String name, TopicConfig config) {
+        TopicPublishLimiter existing = limiterMap.get(name);
+        if (existing != null) {
+            return existing;
+        }
+        int limit = config.getMaxConcurrentPublishes();
+        if (limit <= 0) {
+            limit = nodeEngine.getProperties().getInteger(ClusterProperty.TOPIC_MAX_CONCURRENT_PUBLISHES);
+        }
+        TopicPublishLimiter limiter = new TopicPublishLimiter(limit);
+        TopicPublishLimiter previous = limiterMap.putIfAbsent(name, limiter);
+        return previous != null ? previous : limiter;
+    }
+
+    private TopicPublishLimiter getLimiter(String topicName) {
+        TopicPublishLimiter limiter = limiterMap.get(topicName);
+        if (limiter != null) {
+            return limiter;
+        }
+        TopicConfig topicConfig = nodeEngine.getConfig().findTopicConfig(topicName);
+        return ensureLimiter(topicName, topicConfig);
+    }
+
     /**
      * Increments the number of published messages on the ITopic
      * with the name {@code topicName}.
@@ -177,12 +213,49 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     }
 
     public void publishMessage(String topicName, Object payload, boolean multithreaded) {
-        Collection<EventRegistration> registrations = eventService.getRegistrations(SERVICE_NAME, topicName);
-        if (!registrations.isEmpty()) {
-            Data payloadData = nodeEngine.toData(payload);
-            TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
-            int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
-            eventService.publishEvent(SERVICE_NAME, registrations, topicEvent, partitionId);
+        TopicPublishLimiter limiter = getLimiter(topicName);
+        LocalTopicStatsImpl stats = getLocalTopicStats(topicName);
+        if (limiter != null && limiter.isEnabled() && !limiter.tryAcquire()) {
+            stats.incrementRejectedPublishes();
+            throw new TopicOverloadException("Too many concurrent publishes for topic: " + topicName);
+        }
+
+        if (limiter != null && limiter.isEnabled()) {
+            stats.incrementInFlightPublishes();
+        }
+        try {
+            Collection<EventRegistration> registrations = eventService.getRegistrations(SERVICE_NAME, topicName);
+            if (!registrations.isEmpty()) {
+                Data payloadData = nodeEngine.toData(payload);
+                TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
+                int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
+                eventService.publishEvent(SERVICE_NAME, registrations, topicEvent, partitionId);
+                if (limiter != null && limiter.isEnabled()) {
+                    eventService.executeEventCallback(new StripedRunnable() {
+                        @Override
+                        public int getKey() {
+                            return partitionId;
+                        }
+
+                        @Override
+                        public void run() {
+                            limiter.release();
+                            stats.decrementInFlightPublishes();
+                        }
+                    });
+                }
+            } else {
+                if (limiter != null && limiter.isEnabled()) {
+                    limiter.release();
+                    stats.decrementInFlightPublishes();
+                }
+            }
+        } catch (RuntimeException e) {
+            if (limiter != null && limiter.isEnabled()) {
+                limiter.release();
+                stats.decrementInFlightPublishes();
+            }
+            throw e;
         }
     }
 
@@ -229,6 +302,24 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     @Override
     public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext context) {
         provide(descriptor, context, TOPIC_PREFIX, getStats());
+    }
+
+    @Override
+    public void memberAdded(MembershipEvent membershipEvent) {
+        // no-op
+    }
+
+    @Override
+    public void memberRemoved(MembershipEvent membershipEvent) {
+        for (Map.Entry<String, TopicPublishLimiter> entry : limiterMap.entrySet()) {
+            TopicPublishLimiter limiter = entry.getValue();
+            if (limiter != null && limiter.isEnabled()) {
+                int released = limiter.releaseAll();
+                if (released > 0) {
+                    getLocalTopicStats(entry.getKey()).decrementInFlightPublishes(released);
+                }
+            }
+        }
     }
 
     public static String lookupNamespace(NodeEngine nodeEngine, String topicName) {

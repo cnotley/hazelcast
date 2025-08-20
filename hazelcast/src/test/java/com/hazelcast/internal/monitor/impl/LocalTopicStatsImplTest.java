@@ -43,6 +43,9 @@ public class LocalTopicStatsImplTest {
         localTopicStats.incrementPublishes();
         localTopicStats.incrementReceives();
         localTopicStats.incrementReceives();
+        localTopicStats.incrementRejectedPublishes();
+        localTopicStats.incrementInFlightPublishes();
+        localTopicStats.decrementInFlightPublishes();
     }
 
     @Test
@@ -50,6 +53,8 @@ public class LocalTopicStatsImplTest {
         assertTrue(localTopicStats.getCreationTime() > 0);
         assertEquals(3, localTopicStats.getPublishOperationCount());
         assertEquals(2, localTopicStats.getReceiveOperationCount());
+        assertEquals(1, localTopicStats.getRejectedPublishOperationCount());
+        assertEquals(0, localTopicStats.getInFlightPublishOperationCount());
         assertNotNull(localTopicStats.toString());
     }
 }

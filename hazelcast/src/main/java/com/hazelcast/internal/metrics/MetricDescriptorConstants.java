@@ -577,6 +577,8 @@ public final class MetricDescriptorConstants {
     public static final String TOPIC_METRIC_CREATION_TIME = "creationTime";
     public static final String TOPIC_METRIC_TOTAL_PUBLISHES = "totalPublishes";
     public static final String TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES = "totalReceivedMessages";
+    public static final String TOPIC_METRIC_REJECTED_PUBLISHES = "rejectedPublishes";
+    public static final String TOPIC_METRIC_IN_FLIGHT_PUBLISHES = "inFlightPublishes";
     // ===[/TOPIC]=======================================================
 
     // ===[TRANSACTIONS]================================================
