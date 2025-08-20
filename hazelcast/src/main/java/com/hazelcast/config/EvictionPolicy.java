@@ -35,7 +35,12 @@ public enum EvictionPolicy {
     /**
      * Randomly
      */
-    RANDOM(3);
+    RANDOM(3),
+
+    /**
+     * Composite eviction policy combining multiple metrics.
+     */
+    COMPOSITE(4);
 
     private static final EvictionPolicy[] VALUES = values();
 

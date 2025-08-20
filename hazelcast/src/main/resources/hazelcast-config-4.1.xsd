@@ -3331,6 +3331,7 @@
             <xs:enumeration value="LRU"/>
             <xs:enumeration value="LFU"/>
             <xs:enumeration value="RANDOM"/>
+            <xs:enumeration value="COMPOSITE"/>
         </xs:restriction>
     </xs:simpleType>
 
