@@ -28,6 +28,7 @@ import com.hazelcast.spi.impl.operationservice.impl.InboundResponseHandlerSuppli
 import com.hazelcast.spi.impl.operationservice.impl.InboundResponseHandlerSupplier.AsyncSingleThreadedResponseHandler;
 import com.hazelcast.spi.impl.operationservice.impl.responses.NormalResponse;
 import com.hazelcast.spi.impl.sequence.CallIdSequenceWithoutBackpressure;
+import com.hazelcast.spi.impl.operationservice.impl.PerTargetInvocationTracker;
 import com.hazelcast.spi.properties.ClusterProperty;
 import com.hazelcast.spi.properties.HazelcastProperties;
 import com.hazelcast.test.HazelcastParallelClassRunner;
@@ -63,7 +64,8 @@ public class InboundResponseHandlerSupplierTest extends HazelcastTestSupport {
     public void setup() {
         ILogger logger = Logger.getLogger(getClass());
         HazelcastProperties properties = new HazelcastProperties(new Properties());
-        invocationRegistry = new InvocationRegistry(logger, new CallIdSequenceWithoutBackpressure(), properties);
+        PerTargetInvocationTracker tracker = new PerTargetInvocationTracker(properties);
+        invocationRegistry = new InvocationRegistry(logger, new CallIdSequenceWithoutBackpressure(), properties, tracker);
         serializationService = new DefaultSerializationServiceBuilder().build();
         nodeEngine = mock(NodeEngine.class);
         when(nodeEngine.getLogger(any(Class.class))).thenReturn(logger);
