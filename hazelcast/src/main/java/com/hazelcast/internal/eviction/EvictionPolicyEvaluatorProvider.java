@@ -17,6 +17,7 @@
 package com.hazelcast.internal.eviction;
 
 import com.hazelcast.config.EvictionPolicy;
+import com.hazelcast.internal.eviction.impl.comparator.CompositeMapEvictionPolicyComparator;
 import com.hazelcast.internal.eviction.impl.comparator.LFUEvictionPolicyComparator;
 import com.hazelcast.internal.eviction.impl.comparator.LRUEvictionPolicyComparator;
 import com.hazelcast.internal.eviction.impl.comparator.RandomEvictionPolicyComparator;
@@ -95,6 +96,8 @@ public final class EvictionPolicyEvaluatorProvider {
                 return LFUEvictionPolicyComparator.INSTANCE;
             case RANDOM:
                 return RandomEvictionPolicyComparator.INSTANCE;
+            case COMPOSITE:
+                return new CompositeMapEvictionPolicyComparator();
             case NONE:
                 return null;
             default:

@@ -67,6 +67,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static com.hazelcast.config.EvictionPolicy.COMPOSITE;
 import static com.hazelcast.config.EvictionPolicy.LFU;
 import static com.hazelcast.config.EvictionPolicy.LRU;
 import static com.hazelcast.config.EvictionPolicy.NONE;
@@ -101,13 +102,13 @@ import static java.lang.String.format;
 @SuppressWarnings({"checkstyle:classfanoutcomplexity", "checkstyle:methodcount"})
 public final class ConfigValidator {
 
-    public static final Set<EvictionPolicy> COMMONLY_SUPPORTED_EVICTION_POLICIES = EnumSet.of(LRU, LFU);
+    public static final Set<EvictionPolicy> COMMONLY_SUPPORTED_EVICTION_POLICIES = EnumSet.of(LRU, LFU, COMPOSITE);
 
     private static final Set<MaxSizePolicy> NEAR_CACHE_SUPPORTED_ON_HEAP_MAX_SIZE_POLICIES
             = EnumSet.of(MaxSizePolicy.ENTRY_COUNT);
 
     private static final Set<EvictionPolicy> MAP_SUPPORTED_EVICTION_POLICIES
-            = EnumSet.of(LRU, LFU, RANDOM, NONE);
+            = EnumSet.of(LRU, LFU, RANDOM, NONE, COMPOSITE);
 
     private static final Set<MaxSizePolicy> MAP_SUPPORTED_NATIVE_MAX_SIZE_POLICIES
             = EnumSet.of(PER_NODE, PER_PARTITION, USED_NATIVE_MEMORY_PERCENTAGE,
