@@ -90,6 +90,15 @@ public class TopicConfigTest {
         assertFalse(topicConfig.isMultiThreadingEnabled());
     }
 
+    @Test
+    public void testSetMaxConcurrentPublishes() {
+        TopicConfig config = new TopicConfig();
+        config.setMaxConcurrentPublishes(5);
+        assertEquals(5, config.getMaxConcurrentPublishes());
+        assertThatThrownBy(() -> config.setMaxConcurrentPublishes(-1))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     /**
      * Test method for {@link com.hazelcast.config.TopicConfig#setMultiThreadingEnabled(boolean)}.
      */

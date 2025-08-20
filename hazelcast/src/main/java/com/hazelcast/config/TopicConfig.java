@@ -30,9 +30,11 @@ import java.util.List;
 import java.util.Objects;
 
 import static com.hazelcast.internal.cluster.Versions.V5_4;
+import static com.hazelcast.internal.cluster.Versions.V5_5;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.readNullableList;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.writeNullableList;
 import static com.hazelcast.internal.util.Preconditions.checkHasText;
+import static com.hazelcast.internal.util.Preconditions.checkNotNegative;
 import static com.hazelcast.internal.util.Preconditions.isNotNull;
 
 /**
@@ -50,6 +52,11 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
     private boolean globalOrderingEnabled = DEFAULT_GLOBAL_ORDERING_ENABLED;
     private boolean statisticsEnabled = true;
     private boolean multiThreadingEnabled;
+    /**
+     * The maximum number of concurrently in-flight publish operations allowed for this topic.
+     * A value of {@code 0} means unlimited concurrency.
+     */
+    private int maxConcurrentPublishes;
     private List<ListenerConfig> listenerConfigs;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
 
@@ -78,6 +85,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         this.name = config.name;
         this.globalOrderingEnabled = config.globalOrderingEnabled;
         this.multiThreadingEnabled = config.multiThreadingEnabled;
+        this.maxConcurrentPublishes = config.maxConcurrentPublishes;
         this.listenerConfigs = new ArrayList<>(config.getMessageListenerConfigs());
         this.userCodeNamespace = config.userCodeNamespace;
     }
@@ -218,6 +226,26 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
     }
 
     /**
+     * Returns the maximum number of concurrently in-flight publish operations allowed for this topic.
+     * A value of {@code 0} means unlimited concurrency.
+     */
+    public int getMaxConcurrentPublishes() {
+        return maxConcurrentPublishes;
+    }
+
+    /**
+     * Sets the maximum number of concurrently in-flight publish operations allowed for this topic.
+     *
+     * @param max the maximum number of concurrent publishes. {@code 0} means unlimited.
+     * @return the updated TopicConfig
+     * @throws IllegalArgumentException if {@code max} is negative
+     */
+    public TopicConfig setMaxConcurrentPublishes(int max) {
+        this.maxConcurrentPublishes = checkNotNegative(max, "maxConcurrentPublishes must be >= 0");
+        return this;
+    }
+
+    /**
      * {@inheritDoc}
      */
     @Override
@@ -261,6 +289,9 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         if (multiThreadingEnabled != that.multiThreadingEnabled) {
             return false;
         }
+        if (maxConcurrentPublishes != that.maxConcurrentPublishes) {
+            return false;
+        }
         if (listenerConfigs != null && that.listenerConfigs != null && !listenerConfigs.equals(that.listenerConfigs)) {
             return false;
         }
@@ -283,6 +314,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         result = 31 * result + (globalOrderingEnabled ? 1 : 0);
         result = 31 * result + (statisticsEnabled ? 1 : 0);
         result = 31 * result + (multiThreadingEnabled ? 1 : 0);
+        result = 31 * result + maxConcurrentPublishes;
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
         return result;
@@ -293,6 +325,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         return "TopicConfig [name=" + name
                 + ", globalOrderingEnabled=" + globalOrderingEnabled
                 + ", multiThreadingEnabled=" + multiThreadingEnabled
+                + ", maxConcurrentPublishes=" + maxConcurrentPublishes
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", userCodeNamespace=" + userCodeNamespace
                 + "]";
@@ -320,6 +353,10 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
             out.writeString(userCodeNamespace);
         }
+        // RU_COMPAT_5_4
+        if (out.getVersion().isGreaterOrEqual(V5_5)) {
+            out.writeInt(maxConcurrentPublishes);
+        }
     }
 
     @Override
@@ -333,6 +370,10 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
             userCodeNamespace = in.readString();
+        }
+        // RU_COMPAT_5_4
+        if (in.getVersion().isGreaterOrEqual(V5_5)) {
+            maxConcurrentPublishes = in.readInt();
         }
     }
 }

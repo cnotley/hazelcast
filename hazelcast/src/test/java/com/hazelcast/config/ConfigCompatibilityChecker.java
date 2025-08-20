@@ -491,6 +491,7 @@ public class ConfigCompatibilityChecker {
                     && nullSafeEqual(c1.isGlobalOrderingEnabled(), c2.isGlobalOrderingEnabled())
                     && nullSafeEqual(c1.isStatisticsEnabled(), c2.isStatisticsEnabled())
                     && nullSafeEqual(c1.isMultiThreadingEnabled(), c2.isMultiThreadingEnabled())
+                    && nullSafeEqual(c1.getMaxConcurrentPublishes(), c2.getMaxConcurrentPublishes())
                     && nullSafeEqual(c1.getMessageListenerConfigs(), c2.getMessageListenerConfigs());
         }
 
