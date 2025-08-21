@@ -42,6 +42,7 @@ import com.hazelcast.topic.ITopic;
 import com.hazelcast.topic.LocalTopicStats;
 import com.hazelcast.topic.Message;
 import com.hazelcast.topic.MessageListener;
+import com.hazelcast.topic.TopicOverloadException;
 
 import javax.annotation.Nonnull;
 import java.util.Collection;
@@ -76,6 +77,7 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     private EventService eventService;
     private final AtomicInteger counter = new AtomicInteger();
     private Address localAddress;
+    private int defaultMaxConcurrentPublishes;
 
     @Override
     public void init(NodeEngine nodeEngine, Properties properties) {
@@ -85,6 +87,9 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
             orderingLocks[i] = new ReentrantLock();
         }
         eventService = nodeEngine.getEventService();
+
+        defaultMaxConcurrentPublishes = nodeEngine.getProperties()
+                .getInteger(ClusterProperty.TOPIC_MAX_CONCURRENT_PUBLISHES);
 
         boolean dsMetricsEnabled = nodeEngine.getProperties().getBoolean(ClusterProperty.METRICS_DATASTRUCTURES);
         if (dsMetricsEnabled) {
@@ -176,13 +181,42 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
         getLocalTopicStats(topicName).incrementReceives();
     }
 
+    private int getPublishLimit(String topicName) {
+        TopicConfig config = nodeEngine.getConfig().findTopicConfig(topicName);
+        int limit = config.getMaxConcurrentPublishes();
+        if (limit < 0) {
+            limit = defaultMaxConcurrentPublishes;
+        }
+        return limit;
+    }
+
+    void beginPublish(String topicName) {
+        LocalTopicStatsImpl stats = getLocalTopicStats(topicName);
+        long inFlight = stats.incrementInFlightPublishes();
+        int limit = getPublishLimit(topicName);
+        if (limit >= 0 && inFlight > limit) {
+            stats.decrementInFlightPublishes();
+            stats.incrementRejectedPublishes();
+            throw new TopicOverloadException("Concurrent publish limit exceeded for topic " + topicName);
+        }
+    }
+
+    void endPublish(String topicName) {
+        getLocalTopicStats(topicName).decrementInFlightPublishes();
+    }
+
     public void publishMessage(String topicName, Object payload, boolean multithreaded) {
         Collection<EventRegistration> registrations = eventService.getRegistrations(SERVICE_NAME, topicName);
         if (!registrations.isEmpty()) {
-            Data payloadData = nodeEngine.toData(payload);
-            TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
-            int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
-            eventService.publishEvent(SERVICE_NAME, registrations, topicEvent, partitionId);
+            beginPublish(topicName);
+            try {
+                Data payloadData = nodeEngine.toData(payload);
+                TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
+                int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
+                eventService.publishEvent(SERVICE_NAME, registrations, topicEvent, partitionId);
+            } finally {
+                endPublish(topicName);
+            }
         }
     }
 
