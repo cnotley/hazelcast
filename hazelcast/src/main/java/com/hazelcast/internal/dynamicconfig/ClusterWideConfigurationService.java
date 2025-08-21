@@ -717,7 +717,7 @@ public class ClusterWideConfigurationService implements
         configToVersion.put(ListConfig.class, V4_0);
         configToVersion.put(SetConfig.class, V4_0);
         configToVersion.put(ReplicatedMapConfig.class, V4_0);
-        configToVersion.put(TopicConfig.class, V4_0);
+        configToVersion.put(TopicConfig.class, V6_0);
         configToVersion.put(ExecutorConfig.class, V4_0);
         configToVersion.put(DurableExecutorConfig.class, V4_0);
         configToVersion.put(ScheduledExecutorConfig.class, V4_0);

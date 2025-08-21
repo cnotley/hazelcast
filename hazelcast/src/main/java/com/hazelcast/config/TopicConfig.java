@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Objects;
 
 import static com.hazelcast.internal.cluster.Versions.V5_4;
+import static com.hazelcast.internal.cluster.Versions.V6_0;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.readNullableList;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.writeNullableList;
 import static com.hazelcast.internal.util.Preconditions.checkHasText;
@@ -52,6 +53,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
     private boolean multiThreadingEnabled;
     private List<ListenerConfig> listenerConfigs;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
+    private int maxConcurrentPublishOperations = -1;
 
     /**
      * Creates a TopicConfig.
@@ -80,6 +82,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         this.multiThreadingEnabled = config.multiThreadingEnabled;
         this.listenerConfigs = new ArrayList<>(config.getMessageListenerConfigs());
         this.userCodeNamespace = config.userCodeNamespace;
+        this.maxConcurrentPublishOperations = config.maxConcurrentPublishOperations;
     }
 
     /**
@@ -161,6 +164,30 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
             throw new IllegalArgumentException("Multi-threading can not be enabled when global ordering is used.");
         }
         this.multiThreadingEnabled = multiThreadingEnabled;
+        return this;
+    }
+
+    /**
+     * Returns the maximum number of concurrent publish operations allowed for this topic.
+     * A negative value means there is no limit.
+     */
+    public int getMaxConcurrentPublishOperations() {
+        return maxConcurrentPublishOperations;
+    }
+
+    /**
+     * Sets the maximum number of concurrent publish operations allowed for this topic.
+     * A non-negative value enables limiting; a negative value disables it.
+     *
+     * @param maxConcurrentPublishOperations maximum allowed concurrent publishes
+     * @return the updated TopicConfig
+     * @throws IllegalArgumentException if {@code maxConcurrentPublishOperations} is negative
+     */
+    public TopicConfig setMaxConcurrentPublishOperations(int maxConcurrentPublishOperations) {
+        if (maxConcurrentPublishOperations < 0) {
+            throw new IllegalArgumentException("maxConcurrentPublishOperations must be >= 0");
+        }
+        this.maxConcurrentPublishOperations = maxConcurrentPublishOperations;
         return this;
     }
 
@@ -273,6 +300,9 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         if (!Objects.equals(userCodeNamespace, that.userCodeNamespace)) {
             return false;
         }
+        if (maxConcurrentPublishOperations != that.maxConcurrentPublishOperations) {
+            return false;
+        }
         return name != null ? name.equals(that.name) : that.name == null;
     }
 
@@ -285,6 +315,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         result = 31 * result + (multiThreadingEnabled ? 1 : 0);
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
+        result = 31 * result + maxConcurrentPublishOperations;
         return result;
     }
 
@@ -295,6 +326,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
                 + ", multiThreadingEnabled=" + multiThreadingEnabled
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", userCodeNamespace=" + userCodeNamespace
+                + ", maxConcurrentPublishOperations=" + maxConcurrentPublishOperations
                 + "]";
     }
 
@@ -320,6 +352,9 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
             out.writeString(userCodeNamespace);
         }
+        if (out.getVersion().isGreaterOrEqual(V6_0)) {
+            out.writeInt(maxConcurrentPublishOperations);
+        }
     }
 
     @Override
@@ -333,6 +368,9 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
             userCodeNamespace = in.readString();
+        }
+        if (in.getVersion().isGreaterOrEqual(V6_0)) {
+            maxConcurrentPublishOperations = in.readInt();
         }
     }
 }

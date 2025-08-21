@@ -37,7 +37,10 @@ import com.hazelcast.spi.impl.NodeEngine;
 import com.hazelcast.spi.impl.eventservice.EventPublishingService;
 import com.hazelcast.spi.impl.eventservice.EventRegistration;
 import com.hazelcast.spi.impl.eventservice.EventService;
+import com.hazelcast.spi.impl.eventservice.impl.EventServiceImpl;
 import com.hazelcast.spi.properties.ClusterProperty;
+import com.hazelcast.core.HazelcastOverloadException;
+import com.hazelcast.internal.util.executor.StripedRunnable;
 import com.hazelcast.topic.ITopic;
 import com.hazelcast.topic.LocalTopicStats;
 import com.hazelcast.topic.Message;
@@ -68,14 +71,18 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     public static final int ORDERING_LOCKS_LENGTH = 1000;
 
     private final ConcurrentMap<String, LocalTopicStatsImpl> statsMap = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, PublishLimiter> publishLimiters = new ConcurrentHashMap<>();
     private final Lock[] orderingLocks = new Lock[ORDERING_LOCKS_LENGTH];
     private NodeEngine nodeEngine;
 
     private final ConstructorFunction<String, LocalTopicStatsImpl> localTopicStatsConstructorFunction =
             mapName -> new LocalTopicStatsImpl();
+    private final ConstructorFunction<String, PublishLimiter> publishLimiterConstructor =
+            name -> new PublishLimiter(resolveLimit(name), getLocalTopicStats(name));
     private EventService eventService;
     private final AtomicInteger counter = new AtomicInteger();
     private Address localAddress;
+    private int defaultMaxConcurrentPublishes;
 
     @Override
     public void init(NodeEngine nodeEngine, Properties properties) {
@@ -85,6 +92,8 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
             orderingLocks[i] = new ReentrantLock();
         }
         eventService = nodeEngine.getEventService();
+        defaultMaxConcurrentPublishes = nodeEngine.getProperties()
+                .getInteger(ClusterProperty.TOPIC_MAX_CONCURRENT_PUBLISH_OPERATIONS);
 
         boolean dsMetricsEnabled = nodeEngine.getProperties().getBoolean(ClusterProperty.METRICS_DATASTRUCTURES);
         if (dsMetricsEnabled) {
@@ -100,6 +109,7 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     @Override
     public void reset() {
         statsMap.clear();
+        publishLimiters.clear();
     }
 
     @Override
@@ -131,6 +141,7 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
     @Override
     public void destroyDistributedObject(String objectId, boolean local) {
         statsMap.remove(objectId);
+        publishLimiters.remove(objectId);
         nodeEngine.getEventService().deregisterAllLocalListeners(SERVICE_NAME, objectId);
     }
 
@@ -178,11 +189,86 @@ public class TopicService implements ManagedService, RemoteService, EventPublish
 
     public void publishMessage(String topicName, Object payload, boolean multithreaded) {
         Collection<EventRegistration> registrations = eventService.getRegistrations(SERVICE_NAME, topicName);
-        if (!registrations.isEmpty()) {
-            Data payloadData = nodeEngine.toData(payload);
-            TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
-            int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
+        if (registrations.isEmpty()) {
+            return;
+        }
+        PublishLimiter limiter = getPublishLimiter(topicName);
+        if (!limiter.tryAcquire()) {
+            limiter.stats.incrementRejectedPublishes();
+            throw new HazelcastOverloadException("Too many concurrent publishes for topic: " + topicName);
+        }
+        Data payloadData = nodeEngine.toData(payload);
+        TopicEvent topicEvent = new TopicEvent(topicName, payloadData, localAddress);
+        int partitionId = multithreaded ? counter.incrementAndGet() : topicName.hashCode();
+        try {
             eventService.publishEvent(SERVICE_NAME, registrations, topicEvent, partitionId);
+        } finally {
+            schedulePermitRelease(limiter, partitionId);
+        }
+    }
+
+    private PublishLimiter getPublishLimiter(String topicName) {
+        return getOrPutSynchronized(publishLimiters, topicName, publishLimiters, publishLimiterConstructor);
+    }
+
+    private int resolveLimit(String topicName) {
+        TopicConfig topicConfig = nodeEngine.getConfig().findTopicConfig(topicName);
+        int limit = topicConfig.getMaxConcurrentPublishOperations();
+        if (limit < 0) {
+            limit = defaultMaxConcurrentPublishes;
+        }
+        return limit;
+    }
+
+    private void schedulePermitRelease(PublishLimiter limiter, int orderKey) {
+        StripedRunnable callback = new StripedRunnable() {
+            @Override
+            public void run() {
+                limiter.release();
+            }
+
+            @Override
+            public int getKey() {
+                return orderKey;
+            }
+        };
+        try {
+            if (eventService instanceof EventServiceImpl) {
+                ((EventServiceImpl) eventService).executeEventCallback(callback, true);
+            } else {
+                eventService.executeEventCallback(callback);
+            }
+        } catch (Throwable t) {
+            limiter.release();
+        }
+    }
+
+    private static final class PublishLimiter {
+        final int limit;
+        final AtomicInteger inFlight = new AtomicInteger();
+        final LocalTopicStatsImpl stats;
+
+        PublishLimiter(int limit, LocalTopicStatsImpl stats) {
+            this.limit = limit;
+            this.stats = stats;
+        }
+
+        boolean tryAcquire() {
+            for (;;) {
+                int current = inFlight.get();
+                if (limit >= 0 && current >= limit) {
+                    return false;
+                }
+                if (inFlight.compareAndSet(current, current + 1)) {
+                    stats.incrementInFlightPublishes();
+                    return true;
+                }
+            }
+        }
+
+        void release() {
+            inFlight.decrementAndGet();
+            stats.decrementInFlightPublishes();
         }
     }
 

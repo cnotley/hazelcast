@@ -2701,6 +2701,9 @@ public class MemberDomConfigProcessor extends AbstractDomConfigProcessor {
                 tConfig.setMultiThreadingEnabled(getBooleanValue(getTextContent(n)));
             } else if (matches("user-code-namespace", nodeName)) {
                 tConfig.setUserCodeNamespace(getTextContent(n));
+            } else if (matches("max-concurrent-publish-operations", nodeName)) {
+                tConfig.setMaxConcurrentPublishOperations(getIntegerValue(
+                        "max-concurrent-publish-operations", getTextContent(n)));
             }
         }
         config.addTopicConfig(tConfig);

@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_CREATION_TIME;
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_TOTAL_PUBLISHES;
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES;
+import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_REJECTED_PUBLISHES;
+import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_IN_FLIGHT_PUBLISHES;
 import static com.hazelcast.internal.metrics.ProbeUnit.MS;
 import static java.util.concurrent.atomic.AtomicLongFieldUpdater.newUpdater;
 
@@ -35,6 +37,10 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
             newUpdater(LocalTopicStatsImpl.class, "totalPublishes");
     private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> TOTAL_RECEIVED_MESSAGES =
             newUpdater(LocalTopicStatsImpl.class, "totalReceivedMessages");
+    private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> REJECTED_PUBLISHES =
+            newUpdater(LocalTopicStatsImpl.class, "rejectedPublishes");
+    private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> IN_FLIGHT_PUBLISHES =
+            newUpdater(LocalTopicStatsImpl.class, "inFlightPublishes");
     @Probe(name = TOPIC_METRIC_CREATION_TIME, unit = MS)
     private final long creationTime;
 
@@ -43,6 +49,10 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
     private volatile long totalPublishes;
     @Probe(name = TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES)
     private volatile long totalReceivedMessages;
+    @Probe(name = TOPIC_METRIC_REJECTED_PUBLISHES)
+    private volatile long rejectedPublishes;
+    @Probe(name = TOPIC_METRIC_IN_FLIGHT_PUBLISHES)
+    private volatile long inFlightPublishes;
 
     public LocalTopicStatsImpl() {
         creationTime = Clock.currentTimeMillis();
@@ -76,6 +86,22 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
     }
 
     /**
+     * Returns number of publish operations rejected because concurrency limit was exceeded.
+     */
+    @Override
+    public long getRejectedPublishOperationCount() {
+        return rejectedPublishes;
+    }
+
+    /**
+     * Returns current number of in-flight publish operations for this topic.
+     */
+    @Override
+    public long getInFlightPublishOperationCount() {
+        return inFlightPublishes;
+    }
+
+    /**
      * Increment the number of locally received messages. The count can be local
      * to the member or local to a single listener (whereas there are many listeners
      * on one member).
@@ -87,12 +113,26 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
         TOTAL_RECEIVED_MESSAGES.incrementAndGet(this);
     }
 
+    public void incrementRejectedPublishes() {
+        REJECTED_PUBLISHES.incrementAndGet(this);
+    }
+
+    public void incrementInFlightPublishes() {
+        IN_FLIGHT_PUBLISHES.incrementAndGet(this);
+    }
+
+    public void decrementInFlightPublishes() {
+        IN_FLIGHT_PUBLISHES.decrementAndGet(this);
+    }
+
     @Override
     public String toString() {
         return "LocalTopicStatsImpl{"
                 + "creationTime=" + creationTime
                 + ", totalPublishes=" + totalPublishes
                 + ", totalReceivedMessages=" + totalReceivedMessages
+                + ", rejectedPublishes=" + rejectedPublishes
+                + ", inFlightPublishes=" + inFlightPublishes
                 + '}';
     }
 }

@@ -1589,6 +1589,13 @@ public final class ClusterProperty {
             = new HazelcastProperty("hazelcast.event.queue.capacity", 1000000);
 
     /**
+     * The maximum number of concurrent publish operations allowed per topic.
+     * A negative value disables the limit.
+     */
+    public static final HazelcastProperty TOPIC_MAX_CONCURRENT_PUBLISH_OPERATIONS
+            = new HazelcastProperty("hazelcast.topic.max.concurrent.operations", -1);
+
+    /**
      * The timeout for offering an event to the event executor for processing.
      * If the event queue is full, the event might not be accepted to the queue,
      * and it will be dropped.

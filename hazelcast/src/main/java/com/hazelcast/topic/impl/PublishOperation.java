@@ -22,12 +22,9 @@ import com.hazelcast.nio.ObjectDataInput;
 import com.hazelcast.nio.ObjectDataOutput;
 import com.hazelcast.internal.serialization.Data;
 import com.hazelcast.nio.serialization.IdentifiedDataSerializable;
-import com.hazelcast.spi.impl.eventservice.EventRegistration;
-import com.hazelcast.spi.impl.eventservice.EventService;
 import com.hazelcast.spi.impl.operationservice.AbstractNamedOperation;
 
 import java.io.IOException;
-import java.util.Collection;
 import java.util.concurrent.locks.Lock;
 
 /**
@@ -66,14 +63,10 @@ public class PublishOperation extends AbstractNamedOperation
     @Override
     public void run() throws Exception {
         TopicService service = getService();
-        TopicEvent topicEvent = new TopicEvent(name, message, getCallerAddress());
-        EventService eventService = getNodeEngine().getEventService();
-        Collection<EventRegistration> registrations = eventService.getRegistrations(TopicService.SERVICE_NAME, name);
-
         Lock lock = service.getOrderLock(name);
         lock.lock();
         try {
-            eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
+            service.publishMessage(name, message, false);
         } finally {
             lock.unlock();
         }
