@@ -510,6 +510,10 @@ public class DynamicConfigYamlGenerator {
             addNonNullToMap(subConfigAsMap, "multi-threading-enabled",
                     subConfigAsObject.isMultiThreadingEnabled());
             addNonNullToMap(subConfigAsMap, "user-code-namespace", subConfigAsObject.getUserCodeNamespace());
+            if (subConfigAsObject.getMaxConcurrentPublishOperations() >= 0) {
+                addNonNullToMap(subConfigAsMap, "max-concurrent-publish-operations",
+                        subConfigAsObject.getMaxConcurrentPublishOperations());
+            }
 
             child.put(subConfigAsObject.getName(), subConfigAsMap);
         }

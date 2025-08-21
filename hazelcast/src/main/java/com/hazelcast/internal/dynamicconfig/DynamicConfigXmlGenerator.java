@@ -330,6 +330,9 @@ public final class DynamicConfigXmlGenerator {
             if (t.getUserCodeNamespace() != null) {
                 gen.node("user-code-namespace", t.getUserCodeNamespace());
             }
+            if (t.getMaxConcurrentPublishOperations() >= 0) {
+                gen.node("max-concurrent-publish-operations", t.getMaxConcurrentPublishOperations());
+            }
             gen.close();
         }
     }

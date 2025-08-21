@@ -22,13 +22,10 @@ import com.hazelcast.internal.serialization.Data;
 import com.hazelcast.nio.ObjectDataInput;
 import com.hazelcast.nio.ObjectDataOutput;
 import com.hazelcast.nio.serialization.IdentifiedDataSerializable;
-import com.hazelcast.spi.impl.eventservice.EventRegistration;
-import com.hazelcast.spi.impl.eventservice.EventService;
 import com.hazelcast.spi.impl.operationservice.AbstractNamedOperation;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
 import java.io.IOException;
-import java.util.Collection;
 import java.util.concurrent.locks.Lock;
 
 /**
@@ -55,15 +52,11 @@ public class PublishAllOperation extends AbstractNamedOperation
     @Override
     public void run() throws Exception {
         TopicService service = getService();
-        EventService eventService = getNodeEngine().getEventService();
-        Collection<EventRegistration> registrations = eventService.getRegistrations(TopicService.SERVICE_NAME, name);
-
         Lock lock = service.getOrderLock(name);
         lock.lock();
         try {
             for (Data item : messages) {
-                TopicEvent topicEvent = new TopicEvent(name, item, getCallerAddress());
-                eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
+                service.publishMessage(name, item, false);
                 service.incrementPublishes(name);
             }
         } finally {
