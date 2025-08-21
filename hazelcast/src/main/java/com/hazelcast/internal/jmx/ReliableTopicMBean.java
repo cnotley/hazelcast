@@ -49,6 +49,18 @@ public class ReliableTopicMBean extends HazelcastMBean<ReliableTopicProxy> {
         return managedObject.getLocalTopicStats().getReceiveOperationCount();
     }
 
+    @ManagedAnnotation("localPublishOperationRejectedCount")
+    @ManagedDescription("the number of publish operations rejected due to exceeding the limit on this member")
+    public long getLocalPublishOperationRejectedCount() {
+        return managedObject.getLocalTopicStats().getPublishOperationRejectedCount();
+    }
+
+    @ManagedAnnotation("localInFlightPublishOperationCount")
+    @ManagedDescription("the current number of in-flight publish operations on this member")
+    public long getLocalInFlightPublishOperationCount() {
+        return managedObject.getLocalTopicStats().getInFlightPublishOperationCount();
+    }
+
     @ManagedAnnotation("name")
     @ManagedDescription("Name of the DistributedObject")
     public String getName() {

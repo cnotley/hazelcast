@@ -1318,6 +1318,13 @@ public final class ClusterProperty {
     public static final HazelcastProperty MAP_WRITE_BEHIND_QUEUE_CAPACITY
             = new HazelcastProperty("hazelcast.map.write.behind.queue.capacity", 50000);
 
+    /**
+     * Cluster-wide default maximum number of concurrent publish operations per topic.
+     * A negative value disables the limit.
+     */
+    public static final HazelcastProperty TOPIC_MAX_CONCURRENT_PUBLISHES
+            = new HazelcastProperty("hazelcast.topic.max.concurrent.publishes", -1);
+
     /*
      * INVOCATION / OPERATION SYSTEM PROPERTIES
      */

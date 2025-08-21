@@ -66,16 +66,23 @@ public class PublishOperation extends AbstractNamedOperation
     @Override
     public void run() throws Exception {
         TopicService service = getService();
-        TopicEvent topicEvent = new TopicEvent(name, message, getCallerAddress());
         EventService eventService = getNodeEngine().getEventService();
         Collection<EventRegistration> registrations = eventService.getRegistrations(TopicService.SERVICE_NAME, name);
-
-        Lock lock = service.getOrderLock(name);
-        lock.lock();
+        if (registrations.isEmpty()) {
+            return;
+        }
+        service.beginPublish(name);
         try {
-            eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
+            TopicEvent topicEvent = new TopicEvent(name, message, getCallerAddress());
+            Lock lock = service.getOrderLock(name);
+            lock.lock();
+            try {
+                eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
+            } finally {
+                lock.unlock();
+            }
         } finally {
-            lock.unlock();
+            service.endPublish(name);
         }
     }
 

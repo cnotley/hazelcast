@@ -57,17 +57,24 @@ public class PublishAllOperation extends AbstractNamedOperation
         TopicService service = getService();
         EventService eventService = getNodeEngine().getEventService();
         Collection<EventRegistration> registrations = eventService.getRegistrations(TopicService.SERVICE_NAME, name);
-
-        Lock lock = service.getOrderLock(name);
-        lock.lock();
+        if (registrations.isEmpty()) {
+            return;
+        }
+        service.beginPublish(name);
         try {
-            for (Data item : messages) {
-                TopicEvent topicEvent = new TopicEvent(name, item, getCallerAddress());
-                eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
-                service.incrementPublishes(name);
+            Lock lock = service.getOrderLock(name);
+            lock.lock();
+            try {
+                for (Data item : messages) {
+                    TopicEvent topicEvent = new TopicEvent(name, item, getCallerAddress());
+                    eventService.publishEvent(TopicService.SERVICE_NAME, registrations, topicEvent, name.hashCode());
+                    service.incrementPublishes(name);
+                }
+            } finally {
+                lock.unlock();
             }
         } finally {
-            lock.unlock();
+            service.endPublish(name);
         }
     }
 

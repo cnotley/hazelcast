@@ -77,4 +77,9 @@ public class TopicConfigReadOnly extends TopicConfig {
     public TopicConfig setUserCodeNamespace(@Nullable String userCodeNamespace) {
         throw new UnsupportedOperationException("This config is read-only topic: " + getName());
     }
+
+    @Override
+    public TopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        throw new UnsupportedOperationException("This config is read-only topic: " + getName());
+    }
 }
