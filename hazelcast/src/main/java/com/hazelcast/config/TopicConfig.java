@@ -25,6 +25,8 @@ import com.hazelcast.topic.ITopic;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -39,7 +41,7 @@ import static com.hazelcast.internal.util.Preconditions.isNotNull;
  * Contains the configuration for a {@link ITopic}.
  */
 public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Versioned,
-                                    UserCodeNamespaceAwareConfig<TopicConfig> {
+                                    UserCodeNamespaceAwareConfig<TopicConfig>, java.io.Serializable {
 
     /**
      * Default global ordering configuration.
@@ -52,11 +54,17 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
     private boolean multiThreadingEnabled;
     private List<ListenerConfig> listenerConfigs;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
+    private int maxConcurrentPublishes = -1;
 
     /**
      * Creates a TopicConfig.
      */
     public TopicConfig() {
+        this(-1);
+    }
+
+    public TopicConfig(int maxConcurrentPublishes) {
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -65,7 +73,12 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
      * @param name the name of the Topic
      */
     public TopicConfig(String name) {
+        this(name, -1);
+    }
+
+    public TopicConfig(String name, int maxConcurrentPublishes) {
         setName(name);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -74,12 +87,17 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
      * @param config the TopicConfig to clone
      */
     public TopicConfig(TopicConfig config) {
+        this(config, -1);
+    }
+
+    public TopicConfig(TopicConfig config, int maxConcurrentPublishes) {
         isNotNull(config, "config");
         this.name = config.name;
         this.globalOrderingEnabled = config.globalOrderingEnabled;
         this.multiThreadingEnabled = config.multiThreadingEnabled;
         this.listenerConfigs = new ArrayList<>(config.getMessageListenerConfigs());
         this.userCodeNamespace = config.userCodeNamespace;
+        this.maxConcurrentPublishes = maxConcurrentPublishes;
     }
 
     /**
@@ -161,6 +179,18 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
             throw new IllegalArgumentException("Multi-threading can not be enabled when global ordering is used.");
         }
         this.multiThreadingEnabled = multiThreadingEnabled;
+        return this;
+    }
+
+    public int getMaxConcurrentPublishes() {
+        return maxConcurrentPublishes;
+    }
+
+    public TopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        if (maxConcurrentPublishes < -1) {
+            throw new IllegalArgumentException("maxConcurrentPublishes must be >= -1");
+        }
+        this.maxConcurrentPublishes = maxConcurrentPublishes;
         return this;
     }
 
@@ -273,6 +303,9 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         if (!Objects.equals(userCodeNamespace, that.userCodeNamespace)) {
             return false;
         }
+        if (maxConcurrentPublishes != that.maxConcurrentPublishes) {
+            return false;
+        }
         return name != null ? name.equals(that.name) : that.name == null;
     }
 
@@ -285,6 +318,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         result = 31 * result + (multiThreadingEnabled ? 1 : 0);
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
+        result = 31 * result + maxConcurrentPublishes;
         return result;
     }
 
@@ -295,6 +329,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
                 + ", multiThreadingEnabled=" + multiThreadingEnabled
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", userCodeNamespace=" + userCodeNamespace
+                + ", maxConcurrentPublishes=" + maxConcurrentPublishes
                 + "]";
     }
 
@@ -315,6 +350,7 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         out.writeBoolean(statisticsEnabled);
         out.writeBoolean(multiThreadingEnabled);
         writeNullableList(listenerConfigs, out);
+        out.writeInt(maxConcurrentPublishes);
 
         // RU_COMPAT_5_3
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
@@ -329,10 +365,23 @@ public class TopicConfig implements IdentifiedDataSerializable, NamedConfig, Ver
         statisticsEnabled = in.readBoolean();
         multiThreadingEnabled = in.readBoolean();
         listenerConfigs = readNullableList(in);
+        maxConcurrentPublishes = in.readInt();
 
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
             userCodeNamespace = in.readString();
+        }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws IOException {
+        out.defaultWriteObject();
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws IOException, ClassNotFoundException {
+        try {
+            in.defaultReadObject();
+        } catch (IOException e) {
+            maxConcurrentPublishes = -1;
         }
     }
 }

@@ -22,6 +22,7 @@ import com.hazelcast.config.ReliableTopicConfig;
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstanceAware;
 import com.hazelcast.internal.monitor.impl.LocalTopicStatsImpl;
+import com.hazelcast.topic.TopicOverloadedException;
 import com.hazelcast.internal.namespace.NamespaceUtil;
 import com.hazelcast.internal.nio.ClassLoaderUtil;
 import com.hazelcast.internal.serialization.Data;
@@ -38,6 +39,7 @@ import com.hazelcast.topic.MessageListener;
 import com.hazelcast.topic.ReliableMessageListener;
 import com.hazelcast.topic.TopicOverloadException;
 import com.hazelcast.topic.TopicOverloadPolicy;
+import com.hazelcast.topic.impl.reliable.ConcurrentTopicProcessor;
 
 import javax.annotation.Nonnull;
 import java.util.Collection;
@@ -49,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
+import java.util.concurrent.Semaphore;
 
 import static com.hazelcast.internal.util.ConcurrencyUtil.CALLER_RUNS;
 import static com.hazelcast.internal.util.ExceptionUtil.peel;
@@ -88,6 +91,10 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     private final Address thisAddress;
     private final String name;
 
+    private final ConcurrentTopicProcessor concurrentTopicProcessor;
+    private volatile Semaphore publishSemaphore;
+    private volatile int semaphoreLimit = -1;
+
     public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                               ReliableTopicConfig topicConfig) {
         super(nodeEngine, service);
@@ -100,6 +107,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrentTopicProcessor = new ConcurrentTopicProcessor(nodeEngine.getHazelcastInstance());
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);
@@ -167,6 +175,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public void publish(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
+        int limit = getEffectiveLimit();
+        Semaphore semaphore = acquirePermit(limit);
         try {
             Data data = nodeEngine.toData(payload);
             ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
@@ -189,6 +199,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     "Failed to publish message: " + payload + " to topic:" + getName());
+        } finally {
+            releasePermit(semaphore);
         }
     }
 
@@ -280,7 +292,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     public void publishAll(@Nonnull Collection<? extends E> payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
-
+        int limit = getEffectiveLimit();
+        Semaphore semaphore = acquirePermit(limit);
         try {
             List<ReliableTopicMessage> messages = payload.stream()
                     .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
@@ -308,6 +321,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
+        } finally {
+            releasePermit(semaphore);
         }
     }
 
@@ -317,6 +332,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
 
         InternalCompletableFuture<Void> returnFuture = new InternalCompletableFuture<>();
+        int limit = getEffectiveLimit();
+        Semaphore semaphore = acquirePermit(limit);
         try {
             List<ReliableTopicMessage> messages = payload.stream()
                     .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
@@ -342,7 +359,60 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
                     String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
         }
 
+        if (semaphore != null) {
+            returnFuture.whenComplete((r, t) -> releasePermit(semaphore));
+        }
+
         return returnFuture;
+    }
+
+    private int getEffectiveLimit() {
+        int limit = topicConfig.getMaxConcurrentPublishes();
+        if (limit < 0) {
+            limit = concurrentTopicProcessor.getCurrentLimit();
+        }
+        return limit;
+    }
+
+    private Semaphore acquirePermit(int limit) {
+        if (limit < 0) {
+            return null;
+        }
+        Semaphore sem = ensureSemaphore(limit);
+        boolean acquired;
+        try {
+            acquired = sem.tryAcquire(10, MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            acquired = false;
+        }
+        if (!acquired) {
+            localTopicStats.incrementRejectedPublishes();
+            throw new TopicOverloadedException("Topic [" + name + "] overloaded: maximum concurrent publishes exceeded [" + limit + "]");
+        }
+        localTopicStats.incrementInFlightPublishes();
+        return sem;
+    }
+
+    private Semaphore ensureSemaphore(int limit) {
+        Semaphore sem = publishSemaphore;
+        if (sem == null || semaphoreLimit != limit) {
+            synchronized (this) {
+                if (publishSemaphore == null || semaphoreLimit != limit) {
+                    publishSemaphore = new Semaphore(limit, true);
+                    semaphoreLimit = limit;
+                }
+                sem = publishSemaphore;
+            }
+        }
+        return sem;
+    }
+
+    private void releasePermit(Semaphore sem) {
+        if (sem != null) {
+            sem.release();
+            localTopicStats.decrementInFlightPublishes();
+        }
     }
 
     private void addAsyncOrFail(@Nonnull Collection<? extends E> payload, InternalCompletableFuture<Void> returnFuture,
