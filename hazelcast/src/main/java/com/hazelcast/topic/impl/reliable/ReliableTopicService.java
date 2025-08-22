@@ -19,6 +19,8 @@ package com.hazelcast.topic.impl.reliable;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.ReliableTopicConfig;
 import com.hazelcast.core.DistributedObject;
+import com.hazelcast.cluster.MembershipAdapter;
+import com.hazelcast.cluster.MembershipEvent;
 import com.hazelcast.internal.metrics.DynamicMetricsProvider;
 import com.hazelcast.internal.metrics.MetricDescriptor;
 import com.hazelcast.internal.metrics.MetricsCollectionContext;
@@ -47,6 +49,7 @@ public class ReliableTopicService implements ManagedService, RemoteService,
 
     public static final String SERVICE_NAME = "hz:impl:reliableTopicService";
     private final ConcurrentMap<String, LocalTopicStatsImpl> statsMap = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ReliableTopicProxy<?>> proxies = new ConcurrentHashMap<>();
     private final ConstructorFunction<String, LocalTopicStatsImpl> localTopicStatsConstructorFunction =
         mapName -> new LocalTopicStatsImpl();
 
@@ -59,12 +62,15 @@ public class ReliableTopicService implements ManagedService, RemoteService,
     @Override
     public DistributedObject createDistributedObject(String objectName, UUID source, boolean local) {
         ReliableTopicConfig topicConfig = nodeEngine.getConfig().findReliableTopicConfig(objectName);
-        return new ReliableTopicProxy(objectName, nodeEngine, this, topicConfig);
+        ReliableTopicProxy<?> proxy = new ReliableTopicProxy<>(objectName, nodeEngine, this, topicConfig);
+        proxies.put(objectName, proxy);
+        return proxy;
     }
 
     @Override
     public void destroyDistributedObject(String objectName, boolean local) {
         statsMap.remove(objectName);
+        proxies.remove(objectName);
     }
 
     /**
@@ -97,6 +103,14 @@ public class ReliableTopicService implements ManagedService, RemoteService,
         if (dsMetricsEnabled) {
             nodeEngine.getMetricsRegistry().registerDynamicMetricsProvider(this);
         }
+        nodeEngine.getClusterService().addMembershipListener(new MembershipAdapter() {
+            @Override
+            public void memberRemoved(MembershipEvent event) {
+                for (ReliableTopicProxy<?> proxy : proxies.values()) {
+                    proxy.onMemberRemoved();
+                }
+            }
+        });
     }
 
     @Override
