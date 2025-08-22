@@ -19,7 +19,6 @@ package com.hazelcast.topic.impl.reliable;
 import com.hazelcast.cluster.Address;
 import com.hazelcast.config.ListenerConfig;
 import com.hazelcast.config.ReliableTopicConfig;
-import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstanceAware;
 import com.hazelcast.internal.monitor.impl.LocalTopicStatsImpl;
 import com.hazelcast.internal.namespace.NamespaceUtil;
@@ -37,6 +36,7 @@ import com.hazelcast.topic.LocalTopicStats;
 import com.hazelcast.topic.MessageListener;
 import com.hazelcast.topic.ReliableMessageListener;
 import com.hazelcast.topic.TopicOverloadException;
+import com.hazelcast.topic.TopicOverloadedException;
 import com.hazelcast.topic.TopicOverloadPolicy;
 
 import javax.annotation.Nonnull;
@@ -48,6 +48,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
 
 import static com.hazelcast.internal.util.ConcurrencyUtil.CALLER_RUNS;
@@ -83,6 +84,9 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     final LocalTopicStatsImpl localTopicStats;
     final ReliableTopicConfig topicConfig;
     final TopicOverloadPolicy overloadPolicy;
+    private final ConcurrentTopicProcessor concurrentTopicProcessor;
+    private volatile Semaphore publishSemaphore;
+    private volatile int currentConcurrencyLimit = -1;
 
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
@@ -100,10 +104,32 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrentTopicProcessor = new ConcurrentTopicProcessor(nodeEngine.getProperties());
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);
         }
+    }
+
+    private Semaphore getPublishSemaphore() {
+        int limit = topicConfig.getMaxConcurrentPublishes();
+        if (limit < 0) {
+            limit = concurrentTopicProcessor.getCurrentLimit();
+        }
+        if (limit < 0) {
+            return null;
+        }
+        Semaphore sem = publishSemaphore;
+        if (sem == null || currentConcurrencyLimit != limit) {
+            synchronized (this) {
+                if (publishSemaphore == null || currentConcurrencyLimit != limit) {
+                    publishSemaphore = new Semaphore(limit, true);
+                    currentConcurrencyLimit = limit;
+                }
+                sem = publishSemaphore;
+            }
+        }
+        return sem;
     }
 
     @Override
@@ -167,7 +193,18 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public void publish(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
+        Semaphore sem = getPublishSemaphore();
+        boolean acquired = false;
         try {
+            if (sem != null) {
+                acquired = sem.tryAcquire(10, MILLISECONDS);
+                if (!acquired) {
+                    localTopicStats.incrementRejectedPublishes();
+                    int limit = currentConcurrencyLimit;
+                    throw new TopicOverloadedException("Topic [" + getName() + "] overloaded: maximum concurrent publishes exceeded [" + limit + "]");
+                }
+            }
+            localTopicStats.incrementInFlightPublishes();
             Data data = nodeEngine.toData(payload);
             ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
             switch (overloadPolicy) {
@@ -189,15 +226,43 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     "Failed to publish message: " + payload + " to topic:" + getName());
+        } finally {
+            if (sem != null && acquired) {
+                sem.release();
+            }
+            localTopicStats.decrementInFlightPublishes();
         }
     }
 
     @Override
     public CompletionStage<Void> publishAsync(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
-
+        Semaphore sem = getPublishSemaphore();
+        boolean acquired;
+        try {
+            if (sem != null) {
+                acquired = sem.tryAcquire(10, MILLISECONDS);
+                if (!acquired) {
+                    localTopicStats.incrementRejectedPublishes();
+                    int limit = currentConcurrencyLimit;
+                    throw new TopicOverloadedException("Topic [" + getName() + "] overloaded: maximum concurrent publishes exceeded [" + limit + "]");
+                }
+            } else {
+                acquired = false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TopicOverloadedException("Topic [" + getName() + "] overloaded: maximum concurrent publishes exceeded");
+        }
+        localTopicStats.incrementInFlightPublishes();
         Collection<E> messages = Collections.singleton(payload);
-        return publishAllAsync(messages);
+        CompletionStage<Void> stage = publishAllAsync(messages);
+        return stage.whenComplete((r, t) -> {
+            if (sem != null && acquired) {
+                sem.release();
+            }
+            localTopicStats.decrementInFlightPublishes();
+        });
     }
 
     private Long addOrOverwrite(ReliableTopicMessage message) throws Exception {
