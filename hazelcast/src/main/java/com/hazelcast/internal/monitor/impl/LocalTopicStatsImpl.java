@@ -35,6 +35,10 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
             newUpdater(LocalTopicStatsImpl.class, "totalPublishes");
     private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> TOTAL_RECEIVED_MESSAGES =
             newUpdater(LocalTopicStatsImpl.class, "totalReceivedMessages");
+    private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> REJECTED_PUBLISHES =
+            newUpdater(LocalTopicStatsImpl.class, "rejectedPublishes");
+    private static final AtomicLongFieldUpdater<LocalTopicStatsImpl> IN_FLIGHT_PUBLISHES =
+            newUpdater(LocalTopicStatsImpl.class, "inFlightPublishes");
     @Probe(name = TOPIC_METRIC_CREATION_TIME, unit = MS)
     private final long creationTime;
 
@@ -43,6 +47,10 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
     private volatile long totalPublishes;
     @Probe(name = TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES)
     private volatile long totalReceivedMessages;
+    @Probe
+    private volatile long rejectedPublishes;
+    @Probe
+    private volatile long inFlightPublishes;
 
     public LocalTopicStatsImpl() {
         creationTime = Clock.currentTimeMillis();
@@ -75,6 +83,14 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
         return totalReceivedMessages;
     }
 
+    public long getRejectedPublishes() {
+        return rejectedPublishes;
+    }
+
+    public long getInFlightPublishes() {
+        return inFlightPublishes;
+    }
+
     /**
      * Increment the number of locally received messages. The count can be local
      * to the member or local to a single listener (whereas there are many listeners
@@ -87,12 +103,26 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
         TOTAL_RECEIVED_MESSAGES.incrementAndGet(this);
     }
 
+    public void incrementRejectedPublishes() {
+        REJECTED_PUBLISHES.incrementAndGet(this);
+    }
+
+    public void incrementInFlightPublishes() {
+        IN_FLIGHT_PUBLISHES.incrementAndGet(this);
+    }
+
+    public void decrementInFlightPublishes() {
+        IN_FLIGHT_PUBLISHES.decrementAndGet(this);
+    }
+
     @Override
     public String toString() {
         return "LocalTopicStatsImpl{"
                 + "creationTime=" + creationTime
                 + ", totalPublishes=" + totalPublishes
                 + ", totalReceivedMessages=" + totalReceivedMessages
+                + ", rejectedPublishes=" + rejectedPublishes
+                + ", inFlightPublishes=" + inFlightPublishes
                 + '}';
     }
 }
