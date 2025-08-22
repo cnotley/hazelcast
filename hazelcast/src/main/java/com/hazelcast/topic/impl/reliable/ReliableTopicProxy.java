@@ -38,6 +38,8 @@ import com.hazelcast.topic.MessageListener;
 import com.hazelcast.topic.ReliableMessageListener;
 import com.hazelcast.topic.TopicOverloadException;
 import com.hazelcast.topic.TopicOverloadPolicy;
+import com.hazelcast.topic.TopicOverloadedException;
+import java.util.concurrent.Semaphore;
 
 import javax.annotation.Nonnull;
 import java.util.Collection;
@@ -87,6 +89,9 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
     private final String name;
+    private final ConcurrentTopicProcessor concurrentTopicProcessor;
+    private volatile Semaphore publishSemaphore;
+    private final Object semaphoreMutex = new Object();
 
     public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                               ReliableTopicConfig topicConfig) {
@@ -100,6 +105,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrentTopicProcessor = new ConcurrentTopicProcessor(nodeEngine.getProperties());
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);
@@ -114,6 +120,77 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public String getName() {
         return name;
+    }
+
+    private int getPublishLimit() {
+        int limit = topicConfig.getMaxConcurrentPublishes();
+        if (limit < 0) {
+            limit = concurrentTopicProcessor.getCurrentLimit();
+        }
+        if (limit > 16) {
+            limit = 16;
+        }
+        return limit;
+    }
+
+    private Semaphore acquirePermit(int limit) {
+        Semaphore sem = publishSemaphore;
+        if (sem == null) {
+            synchronized (semaphoreMutex) {
+                sem = publishSemaphore;
+                if (sem == null) {
+                    sem = new Semaphore(limit, true);
+                    publishSemaphore = sem;
+                }
+            }
+        }
+        boolean acquired;
+        try {
+            acquired = sem.tryAcquire(10, MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new HazelcastException(e);
+        }
+        if (!acquired) {
+            localTopicStats.incrementRejectedPublishes();
+            throw new TopicOverloadedException("Topic [" + name
+                    + "] overloaded: maximum concurrent publishes exceeded [" + limit + "]");
+        }
+        localTopicStats.incrementInFlightPublishes();
+        return sem;
+    }
+
+    private void releasePermit(Semaphore sem) {
+        localTopicStats.decrementInFlightPublishes();
+        sem.release();
+    }
+
+    void onMemberRemoved() {
+        Semaphore sem = publishSemaphore;
+        if (sem != null) {
+            int limit = getPublishLimit();
+            sem.drainPermits();
+            sem.release(Math.max(0, limit));
+            localTopicStats.resetInFlightPublishes();
+        }
+    }
+
+    void onMemberAdded() {
+        concurrentTopicProcessor.refreshLimit();
+        int limit = getPublishLimit();
+        if (limit < 0) {
+            publishSemaphore = null;
+            localTopicStats.resetInFlightPublishes();
+            return;
+        }
+        Semaphore sem = publishSemaphore;
+        if (sem == null) {
+            sem = new Semaphore(limit, true);
+            publishSemaphore = sem;
+        }
+        int inFlight = (int) localTopicStats.getInFlightPublishes();
+        sem.drainPermits();
+        sem.release(Math.max(0, limit - inFlight));
     }
 
     private void addMessageListener(ListenerConfig listenerConfig) {
@@ -167,6 +244,11 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public void publish(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
+        int limit = getPublishLimit();
+        Semaphore sem = null;
+        if (limit >= 0) {
+            sem = acquirePermit(limit);
+        }
         try {
             Data data = nodeEngine.toData(payload);
             ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
@@ -189,6 +271,10 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     "Failed to publish message: " + payload + " to topic:" + getName());
+        } finally {
+            if (sem != null) {
+                releasePermit(sem);
+            }
         }
     }
 
@@ -280,7 +366,11 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     public void publishAll(@Nonnull Collection<? extends E> payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
-
+        int limit = getPublishLimit();
+        Semaphore sem = null;
+        if (limit >= 0) {
+            sem = acquirePermit(limit);
+        }
         try {
             List<ReliableTopicMessage> messages = payload.stream()
                     .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
@@ -308,6 +398,10 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
+        } finally {
+            if (sem != null) {
+                releasePermit(sem);
+            }
         }
     }
 
@@ -315,7 +409,11 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     public CompletionStage<Void> publishAllAsync(@Nonnull Collection<? extends E> payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
-
+        int limit = getPublishLimit();
+        Semaphore sem = null;
+        if (limit >= 0) {
+            sem = acquirePermit(limit);
+        }
         InternalCompletableFuture<Void> returnFuture = new InternalCompletableFuture<>();
         try {
             List<ReliableTopicMessage> messages = payload.stream()
@@ -338,10 +436,17 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
                     throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
             }
         } catch (Exception e) {
+            if (sem != null) {
+                releasePermit(sem);
+            }
             throw (RuntimeException) peel(e, null,
                     String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
         }
 
+        if (sem != null) {
+            Semaphore finalSem = sem;
+            returnFuture.whenComplete((r, t) -> releasePermit(finalSem));
+        }
         return returnFuture;
     }
 

@@ -19,6 +19,8 @@ package com.hazelcast.topic.impl.reliable;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.ReliableTopicConfig;
 import com.hazelcast.core.DistributedObject;
+import com.hazelcast.cluster.MembershipEvent;
+import com.hazelcast.cluster.MembershipListener;
 import com.hazelcast.internal.metrics.DynamicMetricsProvider;
 import com.hazelcast.internal.metrics.MetricDescriptor;
 import com.hazelcast.internal.metrics.MetricsCollectionContext;
@@ -54,6 +56,29 @@ public class ReliableTopicService implements ManagedService, RemoteService,
 
     public ReliableTopicService(NodeEngine nodeEngine) {
         this.nodeEngine = nodeEngine;
+        nodeEngine.getClusterService().addMembershipListener(new MembershipListener() {
+            @Override
+            public void memberAdded(MembershipEvent membershipEvent) {
+                handleMembershipChange(true);
+            }
+
+            @Override
+            public void memberRemoved(MembershipEvent membershipEvent) {
+                handleMembershipChange(false);
+            }
+        });
+    }
+
+    private void handleMembershipChange(boolean added) {
+        for (DistributedObject object : nodeEngine.getProxyService().getDistributedObjects(SERVICE_NAME)) {
+            if (object instanceof ReliableTopicProxy proxy) {
+                if (added) {
+                    proxy.onMemberAdded();
+                } else {
+                    proxy.onMemberRemoved();
+                }
+            }
+        }
     }
 
     @Override
