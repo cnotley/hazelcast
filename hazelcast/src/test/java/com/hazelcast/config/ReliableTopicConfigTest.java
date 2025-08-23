@@ -64,10 +64,29 @@ public class ReliableTopicConfigTest {
     }
 
     @Test
+    public void testConstructorWithMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo", 5);
+        assertEquals(5, config.getMaxConcurrentPublishes());
+    }
+
+    @Test
     public void testSetEmptyName() {
         ReliableTopicConfig config = new ReliableTopicConfig("abc");
         config.setName("");
         assertTrue(config.getName().isEmpty());
+    }
+
+    @Test
+    public void testSetMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(10);
+        assertEquals(10, config.getMaxConcurrentPublishes());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSetMaxConcurrentPublishes_whenLessThanMinusOne() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(-2);
     }
 
     @Test
@@ -238,8 +257,8 @@ public class ReliableTopicConfigTest {
 
         String s = config.toString();
 
-        assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null,"
-                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
+        assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null," 
+                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null, maxConcurrentPublishes=-1}", s);
     }
 
     @Test

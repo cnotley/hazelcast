@@ -21,9 +21,12 @@ import com.hazelcast.internal.util.Clock;
 import com.hazelcast.topic.LocalTopicStats;
 import com.hazelcast.topic.impl.reliable.ReliableMessageRunner;
 
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_CREATION_TIME;
+import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_IN_FLIGHT_PUBLISHES;
+import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_REJECTED_PUBLISHES;
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_TOTAL_PUBLISHES;
 import static com.hazelcast.internal.metrics.MetricDescriptorConstants.TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES;
 import static com.hazelcast.internal.metrics.ProbeUnit.MS;
@@ -43,6 +46,12 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
     private volatile long totalPublishes;
     @Probe(name = TOPIC_METRIC_TOTAL_RECEIVED_MESSAGES)
     private volatile long totalReceivedMessages;
+
+    @Probe(name = TOPIC_METRIC_REJECTED_PUBLISHES)
+    private final AtomicLong rejectedPublishes = new AtomicLong();
+
+    @Probe(name = TOPIC_METRIC_IN_FLIGHT_PUBLISHES)
+    private final AtomicLong inFlightPublishes = new AtomicLong();
 
     public LocalTopicStatsImpl() {
         creationTime = Clock.currentTimeMillis();
@@ -87,12 +96,34 @@ public class LocalTopicStatsImpl implements LocalTopicStats {
         TOTAL_RECEIVED_MESSAGES.incrementAndGet(this);
     }
 
+    public void incrementRejectedPublishes() {
+        rejectedPublishes.incrementAndGet();
+    }
+
+    public void incrementInFlightPublishes() {
+        inFlightPublishes.incrementAndGet();
+    }
+
+    public void decrementInFlightPublishes() {
+        inFlightPublishes.decrementAndGet();
+    }
+
+    public long getRejectedPublishes() {
+        return rejectedPublishes.get();
+    }
+
+    public long getInFlightPublishes() {
+        return inFlightPublishes.get();
+    }
+
     @Override
     public String toString() {
         return "LocalTopicStatsImpl{"
                 + "creationTime=" + creationTime
                 + ", totalPublishes=" + totalPublishes
                 + ", totalReceivedMessages=" + totalReceivedMessages
+                + ", rejectedPublishes=" + rejectedPublishes.get()
+                + ", inFlightPublishes=" + inFlightPublishes.get()
                 + '}';
     }
 }

@@ -75,7 +75,9 @@ public class ReliableTopicService implements ManagedService, RemoteService,
      * @return the statistics local to this member
      */
     public LocalTopicStatsImpl getLocalTopicStats(String name) {
-        return getOrPutSynchronized(statsMap, name, statsMap, localTopicStatsConstructorFunction);
+        LocalTopicStatsImpl stats = getOrPutSynchronized(statsMap, name, statsMap, localTopicStatsConstructorFunction);
+        nodeEngine.getMetricsRegistry().registerStaticMetrics(stats, RELIABLE_TOPIC_PREFIX + name);
+        return stats;
     }
 
     @Override
