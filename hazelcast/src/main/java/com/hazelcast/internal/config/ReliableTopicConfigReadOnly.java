@@ -26,7 +26,7 @@ import java.util.concurrent.Executor;
 public class ReliableTopicConfigReadOnly extends ReliableTopicConfig {
 
     public ReliableTopicConfigReadOnly(ReliableTopicConfig config) {
-        super(config);
+        super(config, config.getMaxConcurrentPublishes());
     }
 
     @Override
@@ -56,6 +56,11 @@ public class ReliableTopicConfigReadOnly extends ReliableTopicConfig {
 
     @Override
     public ReliableTopicConfig setUserCodeNamespace(@Nullable String userCodeNamespace) {
+        throw new UnsupportedOperationException("This config is read-only");
+    }
+
+    @Override
+    public ReliableTopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
         throw new UnsupportedOperationException("This config is read-only");
     }
 }

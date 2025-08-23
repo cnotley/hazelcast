@@ -32,8 +32,10 @@ import com.hazelcast.spi.impl.NodeEngine;
 import com.hazelcast.spi.properties.ClusterProperty;
 import com.hazelcast.topic.LocalTopicStats;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -46,6 +48,11 @@ public class ReliableTopicService implements ManagedService, RemoteService,
         StatisticsAwareService<LocalTopicStats>, DynamicMetricsProvider {
 
     public static final String SERVICE_NAME = "hz:impl:reliableTopicService";
+    /**
+     * Built-in dynamic settings for reliable topic subsystem.
+     */
+    public static final Set<ReliableTopicConcurrencyManager.Setting<?>> BUILT_IN_SETTINGS =
+            Collections.singleton(ReliableTopicConcurrencyManager.MAX_CONCURRENT_PUBLISHES_SETTING);
     private final ConcurrentMap<String, LocalTopicStatsImpl> statsMap = new ConcurrentHashMap<>();
     private final ConstructorFunction<String, LocalTopicStatsImpl> localTopicStatsConstructorFunction =
         mapName -> new LocalTopicStatsImpl();
