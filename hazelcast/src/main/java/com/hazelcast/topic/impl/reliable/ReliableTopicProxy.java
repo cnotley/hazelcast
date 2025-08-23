@@ -84,6 +84,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     final ReliableTopicConfig topicConfig;
     final TopicOverloadPolicy overloadPolicy;
 
+    final ReliableTopicConcurrencyManager concurrencyManager;
+
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
     private final String name;
@@ -100,6 +102,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrencyManager = new ReliableTopicConcurrencyManager();
+        this.concurrencyManager.updateConcurrency(topicConfig.getMaxConcurrentPublishes());
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);

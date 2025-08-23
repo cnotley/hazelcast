@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.concurrent.Executor;
 
 import static com.hazelcast.internal.cluster.Versions.V5_4;
+import static com.hazelcast.internal.cluster.Versions.V5_5;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.readNullableList;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.writeNullableList;
 import static com.hazelcast.internal.util.Preconditions.checkNotNull;
@@ -82,6 +83,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
     private List<ListenerConfig> listenerConfigs = new LinkedList<>();
     private TopicOverloadPolicy topicOverloadPolicy = DEFAULT_TOPIC_OVERLOAD_POLICY;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
+    private int maxConcurrentPublishes = 1;
 
     public ReliableTopicConfig() {
     }
@@ -90,7 +92,12 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      * Creates a new ReliableTopicConfig with default settings.
      */
     public ReliableTopicConfig(String name) {
+        this(name, 1);
+    }
+
+    public ReliableTopicConfig(String name, int maxConcurrentPublishes) {
         this.name = checkNotNull(name, "name");
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -99,18 +106,26 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      * @param config the ReliableTopicConfig to clone
      */
     public ReliableTopicConfig(ReliableTopicConfig config) {
-        this.name = config.name;
+        this(config, 1);
+    }
+
+    public ReliableTopicConfig(ReliableTopicConfig config, int maxConcurrentPublishes) {
+        this(config, config.name, maxConcurrentPublishes);
+    }
+
+    ReliableTopicConfig(ReliableTopicConfig config, String name) {
+        this(config, name, 1);
+    }
+
+    ReliableTopicConfig(ReliableTopicConfig config, String name, int maxConcurrentPublishes) {
         this.statisticsEnabled = config.statisticsEnabled;
         this.readBatchSize = config.readBatchSize;
         this.executor = config.executor;
         this.topicOverloadPolicy = config.topicOverloadPolicy;
         this.listenerConfigs = config.listenerConfigs;
         this.userCodeNamespace = config.userCodeNamespace;
-    }
-
-    ReliableTopicConfig(ReliableTopicConfig config, String name) {
-        this(config);
         this.name = name;
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -242,6 +257,15 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         return this;
     }
 
+    public int getMaxConcurrentPublishes() {
+        return maxConcurrentPublishes;
+    }
+
+    public ReliableTopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        this.maxConcurrentPublishes = Math.max(1, Math.min(8, maxConcurrentPublishes));
+        return this;
+    }
+
     /**
      * Checks if statistics are enabled for this reliable topic.
      *
@@ -332,6 +356,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
                 + ", topicOverloadPolicy=" + topicOverloadPolicy
                 + ", executor=" + executor
                 + ", readBatchSize=" + readBatchSize
+                + ", maxConcurrentPublishes=" + maxConcurrentPublishes
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", listenerConfigs=" + listenerConfigs
                 + ", userCodeNamespace=" + userCodeNamespace
@@ -361,6 +386,9 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
             out.writeString(userCodeNamespace);
         }
+        if (out.getVersion().isGreaterOrEqual(V5_5)) {
+            out.writeInt(maxConcurrentPublishes);
+        }
     }
 
     @Override
@@ -375,6 +403,9 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
             userCodeNamespace = in.readString();
+        }
+        if (in.getVersion().isGreaterOrEqual(V5_5)) {
+            maxConcurrentPublishes = in.readInt();
         }
     }
 
@@ -406,7 +437,10 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         if (!Objects.equals(userCodeNamespace, that.userCodeNamespace)) {
             return false;
         }
-        return topicOverloadPolicy == that.topicOverloadPolicy;
+        if (topicOverloadPolicy != that.topicOverloadPolicy) {
+            return false;
+        }
+        return maxConcurrentPublishes == that.maxConcurrentPublishes;
     }
 
     @Override
@@ -418,6 +452,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (topicOverloadPolicy != null ? topicOverloadPolicy.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
+        result = 31 * result + maxConcurrentPublishes;
         return result;
     }
 }
