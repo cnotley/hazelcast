@@ -55,6 +55,7 @@ public class ReliableTopicConfigTest {
         assertEquals("foo", config.getName());
         assertEquals(DEFAULT_TOPIC_OVERLOAD_POLICY, config.getTopicOverloadPolicy());
         assertEquals(DEFAULT_STATISTICS_ENABLED, config.isStatisticsEnabled());
+        assertEquals(1, config.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -118,6 +119,19 @@ public class ReliableTopicConfigTest {
         config.setTopicOverloadPolicy(DISCARD_NEWEST);
 
         assertSame(DISCARD_NEWEST, config.getTopicOverloadPolicy());
+    }
+
+    @Test
+    public void setMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(3);
+        assertEquals(3, config.getMaxConcurrentPublishes());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void setMaxConcurrentPublishes_whenInvalid() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(0);
     }
 
     // ==================== setReadBatchSize =============================\

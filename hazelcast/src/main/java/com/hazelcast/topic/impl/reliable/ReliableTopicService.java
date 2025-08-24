@@ -16,6 +16,8 @@
 
 package com.hazelcast.topic.impl.reliable;
 
+import com.hazelcast.cluster.MembershipEvent;
+import com.hazelcast.cluster.MembershipListener;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.ReliableTopicConfig;
 import com.hazelcast.core.DistributedObject;
@@ -51,20 +53,35 @@ public class ReliableTopicService implements ManagedService, RemoteService,
         mapName -> new LocalTopicStatsImpl();
 
     private final NodeEngine nodeEngine;
+    private final ConcurrentMap<String, ReliableTopicProxy<?>> proxies = new ConcurrentHashMap<>();
 
     public ReliableTopicService(NodeEngine nodeEngine) {
         this.nodeEngine = nodeEngine;
+        nodeEngine.getClusterService().addMembershipListener(new MembershipListener() {
+            @Override
+            public void memberAdded(MembershipEvent membershipEvent) {
+                resetSchedulers();
+            }
+
+            @Override
+            public void memberRemoved(MembershipEvent membershipEvent) {
+                resetSchedulers();
+            }
+        });
     }
 
     @Override
     public DistributedObject createDistributedObject(String objectName, UUID source, boolean local) {
         ReliableTopicConfig topicConfig = nodeEngine.getConfig().findReliableTopicConfig(objectName);
-        return new ReliableTopicProxy(objectName, nodeEngine, this, topicConfig);
+        ReliableTopicProxy proxy = new ReliableTopicProxy(objectName, nodeEngine, this, topicConfig);
+        proxies.put(objectName, proxy);
+        return proxy;
     }
 
     @Override
     public void destroyDistributedObject(String objectName, boolean local) {
         statsMap.remove(objectName);
+        proxies.remove(objectName);
     }
 
     /**
@@ -131,5 +148,11 @@ public class ReliableTopicService implements ManagedService, RemoteService,
             }
         }
         return null;
+    }
+
+    private void resetSchedulers() {
+        for (ReliableTopicProxy<?> proxy : proxies.values()) {
+            proxy.concurrencyManager().reset();
+        }
     }
 }
