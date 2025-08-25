@@ -55,6 +55,11 @@ public class ReliableTopicConfigReadOnly extends ReliableTopicConfig {
     }
 
     @Override
+    public ReliableTopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        throw new UnsupportedOperationException("This config is read-only");
+    }
+
+    @Override
     public ReliableTopicConfig setUserCodeNamespace(@Nullable String userCodeNamespace) {
         throw new UnsupportedOperationException("This config is read-only");
     }

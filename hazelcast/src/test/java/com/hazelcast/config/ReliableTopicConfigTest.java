@@ -55,6 +55,7 @@ public class ReliableTopicConfigTest {
         assertEquals("foo", config.getName());
         assertEquals(DEFAULT_TOPIC_OVERLOAD_POLICY, config.getTopicOverloadPolicy());
         assertEquals(DEFAULT_STATISTICS_ENABLED, config.isStatisticsEnabled());
+        assertEquals(1, config.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -76,7 +77,8 @@ public class ReliableTopicConfigTest {
                 .setTopicOverloadPolicy(TopicOverloadPolicy.ERROR)
                 .setExecutor(mock(Executor.class))
                 .setReadBatchSize(1)
-                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED);
+                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED)
+                .setMaxConcurrentPublishes(2);
 
         ReliableTopicConfig copy = new ReliableTopicConfig(original, "copy");
 
@@ -85,6 +87,7 @@ public class ReliableTopicConfigTest {
         assertEquals(original.getReadBatchSize(), copy.getReadBatchSize());
         assertEquals(original.isStatisticsEnabled(), copy.isStatisticsEnabled());
         assertEquals(original.getTopicOverloadPolicy(), copy.getTopicOverloadPolicy());
+        assertEquals(original.getMaxConcurrentPublishes(), copy.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -93,7 +96,8 @@ public class ReliableTopicConfigTest {
                 .setTopicOverloadPolicy(TopicOverloadPolicy.ERROR)
                 .setExecutor(mock(Executor.class))
                 .setReadBatchSize(1)
-                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED);
+                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED)
+                .setMaxConcurrentPublishes(3);
 
         ReliableTopicConfig copy = new ReliableTopicConfig(original);
 
@@ -102,6 +106,32 @@ public class ReliableTopicConfigTest {
         assertEquals(original.getReadBatchSize(), copy.getReadBatchSize());
         assertEquals(original.isStatisticsEnabled(), copy.isStatisticsEnabled());
         assertEquals(original.getTopicOverloadPolicy(), copy.getTopicOverloadPolicy());
+        assertEquals(original.getMaxConcurrentPublishes(), copy.getMaxConcurrentPublishes());
+    }
+
+    @Test
+    public void testMaxConcurrentPublishesConstructor() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo", 4);
+        assertEquals(4, config.getMaxConcurrentPublishes());
+    }
+
+    @Test
+    public void testSetMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(5);
+        assertEquals(5, config.getMaxConcurrentPublishes());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSetMaxConcurrentPublishesTooLow() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(0);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSetMaxConcurrentPublishesTooHigh() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(9);
     }
 
     // ==================== setTopicOverflowPolicy =============================
@@ -235,11 +265,10 @@ public class ReliableTopicConfigTest {
     @Test
     public void test_toString() {
         ReliableTopicConfig config = new ReliableTopicConfig("foo");
-
         String s = config.toString();
-
         assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null,"
-                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
+                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null,"
+                + " maxConcurrentPublishes=1}", s);
     }
 
     @Test
