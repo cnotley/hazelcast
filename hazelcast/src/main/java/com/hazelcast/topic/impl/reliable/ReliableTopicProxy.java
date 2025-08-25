@@ -47,6 +47,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
@@ -83,6 +84,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     final LocalTopicStatsImpl localTopicStats;
     final ReliableTopicConfig topicConfig;
     final TopicOverloadPolicy overloadPolicy;
+    final ReliableTopicConcurrencyManager concurrencyManager;
 
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
@@ -100,6 +102,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrencyManager = new ReliableTopicConcurrencyManager(topicConfig);
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);
@@ -166,26 +169,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
 
     @Override
     public void publish(@Nonnull E payload) {
-        checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         try {
-            Data data = nodeEngine.toData(payload);
-            ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
-            switch (overloadPolicy) {
-                case ERROR:
-                    addOrFail(message);
-                    break;
-                case DISCARD_OLDEST:
-                    addOrOverwrite(message);
-                    break;
-                case DISCARD_NEWEST:
-                    ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
-                    break;
-                case BLOCK:
-                    addWithBackoff(Collections.singleton(message));
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
-            }
+            publishAsync(payload).toCompletableFuture().get();
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     "Failed to publish message: " + payload + " to topic:" + getName());
@@ -195,37 +180,10 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public CompletionStage<Void> publishAsync(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
-
         Collection<E> messages = Collections.singleton(payload);
         return publishAllAsync(messages);
     }
 
-    private Long addOrOverwrite(ReliableTopicMessage message) throws Exception {
-        return ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).toCompletableFuture().get();
-    }
-
-    private void addOrFail(ReliableTopicMessage message) throws Exception {
-        long sequenceId = ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
-        if (sequenceId == -1) {
-            throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
-        }
-    }
-
-    private void addWithBackoff(Collection<ReliableTopicMessage> messages) throws Exception {
-        long timeoutMs = INITIAL_BACKOFF_MS;
-        for (; ; ) {
-            long result = ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
-            if (result != -1) {
-                break;
-            }
-
-            MILLISECONDS.sleep(timeoutMs);
-            timeoutMs *= 2;
-            if (timeoutMs > MAX_BACKOFF) {
-                timeoutMs = MAX_BACKOFF;
-            }
-        }
-    }
 
     @Nonnull
     @Override
@@ -282,29 +240,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
 
         try {
-            List<ReliableTopicMessage> messages = payload.stream()
-                    .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
-                    .collect(Collectors.toList());
-            switch (overloadPolicy) {
-                case ERROR:
-                    long sequenceId = ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
-                    if (sequenceId == -1) {
-                        throw new TopicOverloadException(
-                                String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
-                    }
-                    break;
-                case DISCARD_OLDEST:
-                    ringbuffer.addAllAsync(messages, OverflowPolicy.OVERWRITE).toCompletableFuture().get();
-                    break;
-                case DISCARD_NEWEST:
-                    ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
-                    break;
-                case BLOCK:
-                    addWithBackoff(messages);
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
-            }
+            publishAllAsync(payload).toCompletableFuture().get();
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
@@ -316,33 +252,36 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         checkNoNullInside(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
 
-        InternalCompletableFuture<Void> returnFuture = new InternalCompletableFuture<>();
-        try {
-            List<ReliableTopicMessage> messages = payload.stream()
-                    .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
-                    .collect(Collectors.toList());
-            switch (overloadPolicy) {
-                case ERROR:
-                    addAsyncOrFail(payload, returnFuture, messages);
-                    break;
-                case DISCARD_OLDEST:
-                    addAsync(messages, OverflowPolicy.OVERWRITE);
-                    break;
-                case DISCARD_NEWEST:
-                    addAsync(messages, OverflowPolicy.FAIL);
-                    break;
-                case BLOCK:
-                    addAsyncAndBlock(payload, returnFuture, messages, INITIAL_BACKOFF_MS);
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
-            }
-        } catch (Exception e) {
-            throw (RuntimeException) peel(e, null,
-                    String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
-        }
+        List<ReliableTopicMessage> messages = payload.stream()
+                .map(m -> new ReliableTopicMessage(nodeEngine.toData(m), thisAddress))
+                .collect(Collectors.toList());
 
-        return returnFuture;
+        return (CompletionStage<Void>) concurrencyManager.schedule(() -> {
+            switch (overloadPolicy) {
+                case ERROR: {
+                    InternalCompletableFuture<Void> f = new InternalCompletableFuture<>();
+                    addAsyncOrFail(payload, f, messages);
+                    return f;
+                }
+                case DISCARD_OLDEST:
+                    return addAsync(messages, OverflowPolicy.OVERWRITE);
+                case DISCARD_NEWEST:
+                    return addAsync(messages, OverflowPolicy.FAIL);
+                case BLOCK: {
+                    InternalCompletableFuture<Void> f = new InternalCompletableFuture<>();
+                    addAsyncAndBlock(payload, f, messages, INITIAL_BACKOFF_MS);
+                    return f;
+                }
+                default:
+                    CompletableFuture<Void> f = new CompletableFuture<>();
+                    f.completeExceptionally(new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy));
+                    return f;
+            }
+        });
+    }
+
+    ReliableTopicConcurrencyManager concurrencyManager() {
+        return concurrencyManager;
     }
 
     private void addAsyncOrFail(@Nonnull Collection<? extends E> payload, InternalCompletableFuture<Void> returnFuture,

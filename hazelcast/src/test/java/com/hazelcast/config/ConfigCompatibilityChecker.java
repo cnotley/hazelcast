@@ -508,7 +508,8 @@ public class ConfigCompatibilityChecker {
                     && nullSafeEqual(c1.getName(), c2.getName())
                     && nullSafeEqual(c1.isStatisticsEnabled(), c2.isStatisticsEnabled())
                     && nullSafeEqual(c1.getMessageListenerConfigs(), c2.getMessageListenerConfigs())
-                    && nullSafeEqual(c1.getTopicOverloadPolicy(), c2.getTopicOverloadPolicy());
+                    && nullSafeEqual(c1.getTopicOverloadPolicy(), c2.getTopicOverloadPolicy())
+                    && nullSafeEqual(c1.getMaxConcurrentPublishes(), c2.getMaxConcurrentPublishes());
         }
 
         @Override

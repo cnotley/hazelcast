@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.concurrent.Executor;
 
 import static com.hazelcast.internal.cluster.Versions.V5_4;
+import static com.hazelcast.internal.cluster.Versions.V6_0;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.readNullableList;
 import static com.hazelcast.internal.serialization.impl.SerializationUtil.writeNullableList;
 import static com.hazelcast.internal.util.Preconditions.checkNotNull;
@@ -75,6 +76,11 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      */
     public static final boolean DEFAULT_STATISTICS_ENABLED = true;
 
+    /**
+     * Default maximum number of concurrent publish operations.
+     */
+    public static final int DEFAULT_MAX_CONCURRENT_PUBLISHES = 1;
+
     private Executor executor;
     private int readBatchSize = DEFAULT_READ_BATCH_SIZE;
     private String name;
@@ -82,6 +88,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
     private List<ListenerConfig> listenerConfigs = new LinkedList<>();
     private TopicOverloadPolicy topicOverloadPolicy = DEFAULT_TOPIC_OVERLOAD_POLICY;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
+    private int maxConcurrentPublishes = DEFAULT_MAX_CONCURRENT_PUBLISHES;
 
     public ReliableTopicConfig() {
     }
@@ -91,6 +98,14 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      */
     public ReliableTopicConfig(String name) {
         this.name = checkNotNull(name, "name");
+    }
+
+    /**
+     * Creates a new ReliableTopicConfig with a custom maximum concurrent publishes setting.
+     */
+    public ReliableTopicConfig(String name, int maxConcurrentPublishes) {
+        this(name);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -106,11 +121,25 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         this.topicOverloadPolicy = config.topicOverloadPolicy;
         this.listenerConfigs = config.listenerConfigs;
         this.userCodeNamespace = config.userCodeNamespace;
+        this.maxConcurrentPublishes = config.maxConcurrentPublishes;
+    }
+
+    /**
+     * Creates a new ReliableTopicConfig by cloning an existing one with a custom maximum concurrent publishes setting.
+     */
+    public ReliableTopicConfig(ReliableTopicConfig config, int maxConcurrentPublishes) {
+        this(config);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     ReliableTopicConfig(ReliableTopicConfig config, String name) {
         this(config);
         this.name = name;
+    }
+
+    ReliableTopicConfig(ReliableTopicConfig config, String name, int maxConcurrentPublishes) {
+        this(config, name);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -155,6 +184,31 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      */
     public ReliableTopicConfig setTopicOverloadPolicy(TopicOverloadPolicy topicOverloadPolicy) {
         this.topicOverloadPolicy = checkNotNull(topicOverloadPolicy, "topicOverloadPolicy can't be null");
+        return this;
+    }
+
+    /**
+     * Gets the maximum number of concurrent publish operations for this topic.
+     *
+     * @return the maximum number of concurrent publishes
+     */
+    public int getMaxConcurrentPublishes() {
+        return maxConcurrentPublishes;
+    }
+
+    /**
+     * Sets the maximum number of concurrent publish operations for this topic.
+     * The value must be between 1 and 8, inclusive.
+     *
+     * @param maxConcurrentPublishes the concurrency limit
+     * @return the updated reliable topic config
+     * @throws IllegalArgumentException if the value is outside of the allowed range
+     */
+    public ReliableTopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        if (maxConcurrentPublishes < 1 || maxConcurrentPublishes > 8) {
+            throw new IllegalArgumentException("maxConcurrentPublishes must be between 1 and 8");
+        }
+        this.maxConcurrentPublishes = maxConcurrentPublishes;
         return this;
     }
 
@@ -335,6 +389,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", listenerConfigs=" + listenerConfigs
                 + ", userCodeNamespace=" + userCodeNamespace
+                + ", maxConcurrentPublishes=" + maxConcurrentPublishes
                 + '}';
     }
 
@@ -361,6 +416,10 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
             out.writeString(userCodeNamespace);
         }
+
+        if (out.getVersion().isGreaterOrEqual(V6_0)) {
+            out.writeInt(maxConcurrentPublishes);
+        }
     }
 
     @Override
@@ -375,6 +434,10 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
             userCodeNamespace = in.readString();
+        }
+
+        if (in.getVersion().isGreaterOrEqual(V6_0)) {
+            maxConcurrentPublishes = in.readInt();
         }
     }
 
@@ -406,6 +469,9 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         if (!Objects.equals(userCodeNamespace, that.userCodeNamespace)) {
             return false;
         }
+        if (maxConcurrentPublishes != that.maxConcurrentPublishes) {
+            return false;
+        }
         return topicOverloadPolicy == that.topicOverloadPolicy;
     }
 
@@ -418,6 +484,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (topicOverloadPolicy != null ? topicOverloadPolicy.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
+        result = 31 * result + maxConcurrentPublishes;
         return result;
     }
 }
