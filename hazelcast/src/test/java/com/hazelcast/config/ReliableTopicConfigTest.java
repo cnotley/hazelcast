@@ -55,6 +55,7 @@ public class ReliableTopicConfigTest {
         assertEquals("foo", config.getName());
         assertEquals(DEFAULT_TOPIC_OVERLOAD_POLICY, config.getTopicOverloadPolicy());
         assertEquals(DEFAULT_STATISTICS_ENABLED, config.isStatisticsEnabled());
+        assertEquals(1, config.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -239,7 +240,7 @@ public class ReliableTopicConfigTest {
         String s = config.toString();
 
         assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null,"
-                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
+                + " readBatchSize=10, maxConcurrentPublishes=1, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
     }
 
     @Test
