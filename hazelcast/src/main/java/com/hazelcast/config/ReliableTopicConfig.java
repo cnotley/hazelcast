@@ -82,6 +82,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
     private List<ListenerConfig> listenerConfigs = new LinkedList<>();
     private TopicOverloadPolicy topicOverloadPolicy = DEFAULT_TOPIC_OVERLOAD_POLICY;
     private @Nullable String userCodeNamespace = DEFAULT_NAMESPACE;
+    private int maxConcurrentPublishes = 1;
 
     public ReliableTopicConfig() {
     }
@@ -91,6 +92,15 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
      */
     public ReliableTopicConfig(String name) {
         this.name = checkNotNull(name, "name");
+    }
+
+    /**
+     * Creates a new ReliableTopicConfig with default settings and the given
+     * concurrency limit for publishes.
+     */
+    public ReliableTopicConfig(String name, int maxConcurrentPublishes) {
+        this(name);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -106,11 +116,22 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         this.topicOverloadPolicy = config.topicOverloadPolicy;
         this.listenerConfigs = config.listenerConfigs;
         this.userCodeNamespace = config.userCodeNamespace;
+        this.maxConcurrentPublishes = config.maxConcurrentPublishes;
     }
 
     ReliableTopicConfig(ReliableTopicConfig config, String name) {
         this(config);
         this.name = name;
+    }
+
+    public ReliableTopicConfig(ReliableTopicConfig config, int maxConcurrentPublishes) {
+        this(config);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
+    }
+
+    ReliableTopicConfig(ReliableTopicConfig config, String name, int maxConcurrentPublishes) {
+        this(config, name);
+        setMaxConcurrentPublishes(maxConcurrentPublishes);
     }
 
     /**
@@ -301,6 +322,25 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
     }
 
     /**
+     * Returns the maximum number of concurrent publish operations allowed.
+     */
+    public int getMaxConcurrentPublishes() {
+        return maxConcurrentPublishes;
+    }
+
+    /**
+     * Sets the maximum number of concurrent publish operations allowed.
+     * The value must be between 1 and 8 inclusive.
+     */
+    public ReliableTopicConfig setMaxConcurrentPublishes(int maxConcurrentPublishes) {
+        if (maxConcurrentPublishes < 1 || maxConcurrentPublishes > 8) {
+            throw new IllegalArgumentException("maxConcurrentPublishes must be between 1 and 8 inclusive");
+        }
+        this.maxConcurrentPublishes = maxConcurrentPublishes;
+        return this;
+    }
+
+    /**
      * {@inheritDoc}
      */
     @Override
@@ -335,6 +375,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
                 + ", statisticsEnabled=" + statisticsEnabled
                 + ", listenerConfigs=" + listenerConfigs
                 + ", userCodeNamespace=" + userCodeNamespace
+                + ", maxConcurrentPublishes=" + maxConcurrentPublishes
                 + '}';
     }
 
@@ -356,6 +397,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         out.writeBoolean(statisticsEnabled);
         writeNullableList(listenerConfigs, out);
         out.writeString(topicOverloadPolicy.name());
+        out.writeInt(maxConcurrentPublishes);
 
         // RU_COMPAT_5_3
         if (out.getVersion().isGreaterOrEqual(V5_4)) {
@@ -371,6 +413,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         statisticsEnabled = in.readBoolean();
         listenerConfigs = readNullableList(in);
         topicOverloadPolicy = TopicOverloadPolicy.valueOf(in.readString());
+        maxConcurrentPublishes = in.readInt();
 
         // RU_COMPAT_5_3
         if (in.getVersion().isGreaterOrEqual(V5_4)) {
@@ -406,7 +449,10 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         if (!Objects.equals(userCodeNamespace, that.userCodeNamespace)) {
             return false;
         }
-        return topicOverloadPolicy == that.topicOverloadPolicy;
+        if (topicOverloadPolicy != that.topicOverloadPolicy) {
+            return false;
+        }
+        return maxConcurrentPublishes == that.maxConcurrentPublishes;
     }
 
     @Override
@@ -418,6 +464,7 @@ public class ReliableTopicConfig implements IdentifiedDataSerializable, NamedCon
         result = 31 * result + (listenerConfigs != null ? listenerConfigs.hashCode() : 0);
         result = 31 * result + (topicOverloadPolicy != null ? topicOverloadPolicy.hashCode() : 0);
         result = 31 * result + (userCodeNamespace != null ? userCodeNamespace.hashCode() : 0);
+        result = 31 * result + maxConcurrentPublishes;
         return result;
     }
 }

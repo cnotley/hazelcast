@@ -83,6 +83,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     final LocalTopicStatsImpl localTopicStats;
     final ReliableTopicConfig topicConfig;
     final TopicOverloadPolicy overloadPolicy;
+    final ReliableTopicConcurrencyManager concurrencyManager;
 
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
@@ -100,6 +101,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
+        this.concurrencyManager = new ReliableTopicConcurrencyManager(topicConfig);
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
             addMessageListener(listenerConfig);
@@ -168,6 +170,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     public void publish(@Nonnull E payload) {
         checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
         try {
+            concurrencyManager.acquirePermit();
             Data data = nodeEngine.toData(payload);
             ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
             switch (overloadPolicy) {
@@ -178,7 +181,9 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
                     addOrOverwrite(message);
                     break;
                 case DISCARD_NEWEST:
-                    ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
+                    concurrencyManager.ordered(
+                            () -> ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture())
+                            .toCompletableFuture().get();
                     break;
                 case BLOCK:
                     addWithBackoff(Collections.singleton(message));
@@ -189,6 +194,8 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
                     "Failed to publish message: " + payload + " to topic:" + getName());
+        } finally {
+            concurrencyManager.releasePermit();
         }
     }
 
@@ -201,11 +208,15 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     }
 
     private Long addOrOverwrite(ReliableTopicMessage message) throws Exception {
-        return ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).toCompletableFuture().get();
+        return concurrencyManager.ordered(
+                () -> ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).toCompletableFuture())
+                .toCompletableFuture().get();
     }
 
     private void addOrFail(ReliableTopicMessage message) throws Exception {
-        long sequenceId = ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
+        long sequenceId = concurrencyManager.ordered(
+                () -> ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture())
+                .toCompletableFuture().get();
         if (sequenceId == -1) {
             throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
         }
@@ -214,7 +225,9 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     private void addWithBackoff(Collection<ReliableTopicMessage> messages) throws Exception {
         long timeoutMs = INITIAL_BACKOFF_MS;
         for (; ; ) {
-            long result = ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
+            long result = concurrencyManager.ordered(
+                    () -> ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture())
+                    .toCompletableFuture().get();
             if (result != -1) {
                 break;
             }
@@ -274,6 +287,10 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     public LocalTopicStats getLocalTopicStats() {
         return localTopicStats;
+    }
+
+    ReliableTopicConcurrencyManager concurrencyManager() {
+        return concurrencyManager;
     }
 
     @Override

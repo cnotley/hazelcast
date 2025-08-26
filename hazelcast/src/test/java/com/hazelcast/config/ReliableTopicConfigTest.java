@@ -55,6 +55,7 @@ public class ReliableTopicConfigTest {
         assertEquals("foo", config.getName());
         assertEquals(DEFAULT_TOPIC_OVERLOAD_POLICY, config.getTopicOverloadPolicy());
         assertEquals(DEFAULT_STATISTICS_ENABLED, config.isStatisticsEnabled());
+        assertEquals(1, config.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -76,7 +77,8 @@ public class ReliableTopicConfigTest {
                 .setTopicOverloadPolicy(TopicOverloadPolicy.ERROR)
                 .setExecutor(mock(Executor.class))
                 .setReadBatchSize(1)
-                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED);
+                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED)
+                .setMaxConcurrentPublishes(2);
 
         ReliableTopicConfig copy = new ReliableTopicConfig(original, "copy");
 
@@ -85,6 +87,7 @@ public class ReliableTopicConfigTest {
         assertEquals(original.getReadBatchSize(), copy.getReadBatchSize());
         assertEquals(original.isStatisticsEnabled(), copy.isStatisticsEnabled());
         assertEquals(original.getTopicOverloadPolicy(), copy.getTopicOverloadPolicy());
+        assertEquals(original.getMaxConcurrentPublishes(), copy.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -93,7 +96,8 @@ public class ReliableTopicConfigTest {
                 .setTopicOverloadPolicy(TopicOverloadPolicy.ERROR)
                 .setExecutor(mock(Executor.class))
                 .setReadBatchSize(1)
-                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED);
+                .setStatisticsEnabled(!DEFAULT_STATISTICS_ENABLED)
+                .setMaxConcurrentPublishes(2);
 
         ReliableTopicConfig copy = new ReliableTopicConfig(original);
 
@@ -102,6 +106,7 @@ public class ReliableTopicConfigTest {
         assertEquals(original.getReadBatchSize(), copy.getReadBatchSize());
         assertEquals(original.isStatisticsEnabled(), copy.isStatisticsEnabled());
         assertEquals(original.getTopicOverloadPolicy(), copy.getTopicOverloadPolicy());
+        assertEquals(original.getMaxConcurrentPublishes(), copy.getMaxConcurrentPublishes());
     }
 
     // ==================== setTopicOverflowPolicy =============================
@@ -147,6 +152,19 @@ public class ReliableTopicConfigTest {
         assertEquals(newValue, config.isStatisticsEnabled());
     }
 
+    @Test
+    public void setMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(3);
+        assertEquals(3, config.getMaxConcurrentPublishes());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void setMaxConcurrentPublishes_whenInvalid() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(0);
+    }
+
     // ===================== listener ===================
 
 
@@ -190,7 +208,8 @@ public class ReliableTopicConfigTest {
                 .setReadBatchSize(201)
                 .setExecutor(executor)
                 .setTopicOverloadPolicy(TopicOverloadPolicy.ERROR)
-                .addMessageListenerConfig(new ListenerConfig("Foobar"));
+                .addMessageListenerConfig(new ListenerConfig("Foobar"))
+                .setMaxConcurrentPublishes(2);
 
         ReliableTopicConfig readOnly = new ReliableTopicConfigReadOnly(config);
 
@@ -200,6 +219,7 @@ public class ReliableTopicConfigTest {
         assertEquals(config.getReadBatchSize(), readOnly.getReadBatchSize());
         assertEquals(config.getTopicOverloadPolicy(), readOnly.getTopicOverloadPolicy());
         assertEquals(config.getMessageListenerConfigs(), readOnly.getMessageListenerConfigs());
+        assertEquals(config.getMaxConcurrentPublishes(), readOnly.getMaxConcurrentPublishes());
 
         try {
             readOnly.setExecutor(null);
@@ -230,6 +250,12 @@ public class ReliableTopicConfigTest {
             fail();
         } catch (UnsupportedOperationException ignored) {
         }
+
+        try {
+            readOnly.setMaxConcurrentPublishes(2);
+            fail();
+        } catch (UnsupportedOperationException ignored) {
+        }
     }
 
     @Test
@@ -239,7 +265,7 @@ public class ReliableTopicConfigTest {
         String s = config.toString();
 
         assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null,"
-                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
+                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null, maxConcurrentPublishes=1}", s);
     }
 
     @Test
