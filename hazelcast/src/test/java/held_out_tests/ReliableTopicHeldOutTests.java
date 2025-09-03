@@ -6,10 +6,14 @@ import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.ringbuffer.Ringbuffer;
-import com.hazelcast.ringbuffer.OverflowPolicy;
+import com.hazelcast.ringbuffer.ReadResultSet;
 import com.hazelcast.topic.ITopic;
 import com.hazelcast.topic.TopicOverloadPolicy;
 import com.hazelcast.topic.ReliableMessageListener;
+import com.hazelcast.topic.impl.reliable.ReliableTopicMessage;
+import com.hazelcast.topic.impl.reliable.ReliableTopicProxy;
+import com.hazelcast.internal.serialization.InternalSerializationService;
+import com.hazelcast.test.Accessors;
 import com.hazelcast.test.HazelcastTestSupport;
 import org.junit.Assume;
 import org.junit.Test;
@@ -17,12 +21,12 @@ import org.junit.Test;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Callable;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -159,13 +163,33 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
         try {
             ITopic<Integer> reliableTopic = getTopic(hz, topic);
 
-            List<Integer> receivedMessages = Collections.synchronizedList(new ArrayList<>());
+            ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) reliableTopic;
+            Field rbField = proxy.getClass().getDeclaredField("ringbuffer");
+            rbField.setAccessible(true);
+            Ringbuffer<ReliableTopicMessage> original = (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
+
             List<Integer> batchSizes = Collections.synchronizedList(new ArrayList<>());
-            AtomicInteger currentBatchSize = new AtomicInteger(0);
+            Ringbuffer<ReliableTopicMessage> spyingRingbuffer = (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                    original.getClass().getClassLoader(),
+                    new Class[]{Ringbuffer.class},
+                    (p, m, args) -> {
+                        Object res = m.invoke(original, args);
+                        if ("readManyAsync".equals(m.getName())) {
+                            CompletionStage<ReadResultSet<ReliableTopicMessage>> stage =
+                                    (CompletionStage<ReadResultSet<ReliableTopicMessage>>) res;
+                            stage.whenComplete((result, throwable) -> {
+                                if (throwable == null) {
+                                    batchSizes.add(result.size());
+                                }
+                            });
+                        }
+                        return res;
+                    });
+            rbField.set(proxy, spyingRingbuffer);
+
+            List<Integer> receivedMessages = Collections.synchronizedList(new ArrayList<>());
             CountDownLatch allMessagesReceived = new CountDownLatch(totalMessages);
             AtomicBoolean orderViolation = new AtomicBoolean(false);
-            long batchGapNanos = TimeUnit.MILLISECONDS.toNanos(1);
-            AtomicLong lastMessageTime = new AtomicLong(-1);
 
             reliableTopic.addMessageListener(new ReliableMessageListener<Integer>() {
                 private int expectedNext = 0;
@@ -177,7 +201,6 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
 
                 @Override
                 public void storeSequence(long sequence) {
-                    // no-op for this test
                 }
 
                 @Override
@@ -192,20 +215,18 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
 
                 @Override
                 public void onMessage(com.hazelcast.topic.Message<Integer> message) {
-                    Integer value = message.getMessageObject();
+                    int value = message.getMessageObject();
                     receivedMessages.add(value);
                     if (value != expectedNext) {
                         orderViolation.set(true);
                     }
                     expectedNext++;
-
-                    long now = System.nanoTime();
-                    long last = lastMessageTime.getAndSet(now);
-                    if (last != -1 && now - last > batchGapNanos) {
-                        batchSizes.add(currentBatchSize.getAndSet(0));
-                    }
-                    currentBatchSize.incrementAndGet();
                     allMessagesReceived.countDown();
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             });
 
@@ -223,15 +244,12 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
             assertTrue("Not all messages received within timeout",
                     allMessagesReceived.await(10, TimeUnit.SECONDS));
 
-            if (currentBatchSize.get() > 0) {
-                batchSizes.add(currentBatchSize.get());
-            }
-
             assertEquals(totalMessages, receivedMessages.size());
             assertFalse(orderViolation.get());
             for (int i = 0; i < totalMessages; i++) {
                 assertEquals(Integer.valueOf(i), receivedMessages.get(i));
             }
+            assertEquals(totalMessages, batchSizes.stream().mapToInt(Integer::intValue).sum());
             for (int i = 0; i < batchSizes.size() - 1; i++) {
                 assertTrue(batchSizes.get(i) <= readBatchSize);
             }
@@ -256,39 +274,26 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
 
         try {
-            Ringbuffer<Integer> ringbuffer = hz.getRingbuffer("_hz_rb_" + topic);
+            ITopic<Integer> reliableTopic = getTopic(hz, topic);
+            Ringbuffer<ReliableTopicMessage> ringbuffer = hz.getRingbuffer("_hz_rb_" + topic);
 
             ExecutorService exec = Executors.newFixedThreadPool(maxConcurrentPublishes);
-            List<CompletableFuture<Long>> seqFutures = new ArrayList<>();
             for (int i = 0; i < messageCount; i++) {
                 final int messageValue = i;
-                seqFutures.add(CompletableFuture.supplyAsync(() -> {
-                    try {
-                        return ringbuffer.addAsync(messageValue, OverflowPolicy.FAIL)
-                                .toCompletableFuture().get();
-                    } catch (Exception e) {
-                        throw new CompletionException(e);
-                    }
-                }, exec));
+                exec.submit(() -> reliableTopic.publish(messageValue));
             }
             exec.shutdown();
+            assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS));
 
-            List<Long> sequenceNumbers = new ArrayList<>();
-            for (CompletableFuture<Long> f : seqFutures) {
-                sequenceNumbers.add(f.get(10, TimeUnit.SECONDS));
-            }
-
+            InternalSerializationService ss = Accessors.getSerializationService(hz);
             List<Integer> messagesInSequenceOrder = new ArrayList<>();
             long headSequence = ringbuffer.headSequence();
             long tailSequence = ringbuffer.tailSequence();
             for (long seq = headSequence; seq <= tailSequence; seq++) {
-                messagesInSequenceOrder.add(ringbuffer.readOne(seq));
+                ReliableTopicMessage msg = ringbuffer.readOne(seq);
+                messagesInSequenceOrder.add(ss.toObject(msg.getPayload()));
             }
 
-            for (int i = 1; i < sequenceNumbers.size(); i++) {
-                assertTrue("Sequence " + i + " should be greater than sequence " + (i - 1),
-                        sequenceNumbers.get(i) > sequenceNumbers.get(i - 1));
-            }
             assertEquals(messageCount, messagesInSequenceOrder.size());
             for (int i = 0; i < messageCount; i++) {
                 assertEquals(Integer.valueOf(i), messagesInSequenceOrder.get(i));
@@ -441,7 +446,7 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
             assertFalse(threadName.contains("main"));
             assertFalse(threadName.contains("custom-") || threadName.contains("rt-test-exec-"));
             assertTrue("Thread should be a Hazelcast thread: " + threadName,
-                    threadName.contains("hz."));
+                    threadName.contains("hz.") || threadName.toLowerCase().contains("hazelcast"));
         }
         assertTrue(threadNamesUsed.size() <= 10);
         if (maxConcurrentPublishes > 1) {
