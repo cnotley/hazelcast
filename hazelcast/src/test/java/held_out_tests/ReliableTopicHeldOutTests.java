@@ -275,28 +275,96 @@ public class ReliableTopicHeldOutTests extends HazelcastTestSupport {
 
         try {
             ITopic<Integer> reliableTopic = getTopic(hz, topic);
-            Ringbuffer<ReliableTopicMessage> ringbuffer = hz.getRingbuffer("_hz_rb_" + topic);
 
-            ExecutorService exec = Executors.newFixedThreadPool(maxConcurrentPublishes);
+            ReliableTopicProxy<Integer> topicProxy = (ReliableTopicProxy<Integer>) reliableTopic;
+            Field ringbufferField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
+            ringbufferField.setAccessible(true);
+            Ringbuffer<ReliableTopicMessage> originalRingbuffer =
+                    (Ringbuffer<ReliableTopicMessage>) ringbufferField.get(topicProxy);
+
+            ConcurrentHashMap<Integer, Long> messageToSequence = new ConcurrentHashMap<>();
+            InternalSerializationService ss = Accessors.getSerializationService(hz);
+
+            Ringbuffer<ReliableTopicMessage> proxyRingbuffer =
+                    (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                            originalRingbuffer.getClass().getClassLoader(),
+                            new Class[]{Ringbuffer.class},
+                            (p, m, args) -> {
+                                if ("addAsync".equals(m.getName())) {
+                                    ReliableTopicMessage msg = (ReliableTopicMessage) args[0];
+                                    CompletionStage<Long> future =
+                                            (CompletionStage<Long>) m.invoke(originalRingbuffer, args);
+                                    future.whenComplete((seq, err) -> {
+                                        if (err == null && msg != null) {
+                                            Integer value = ss.toObject(msg.getPayload());
+                                            messageToSequence.put(value, seq);
+                                        }
+                                    });
+                                    return future;
+                                }
+                                return m.invoke(originalRingbuffer, args);
+                            });
+            ringbufferField.set(topicProxy, proxyRingbuffer);
+
+            CyclicBarrier startBarrier = new CyclicBarrier(messageCount + 1);
+            List<Integer> submissionOrder = Collections.synchronizedList(new ArrayList<>());
+            CountDownLatch allPublished = new CountDownLatch(messageCount);
+            List<Thread> publishThreads = new ArrayList<>();
             for (int i = 0; i < messageCount; i++) {
                 final int messageValue = i;
-                exec.submit(() -> reliableTopic.publish(messageValue));
+                Thread t = new Thread(() -> {
+                    try {
+                        startBarrier.await();
+                        submissionOrder.add(messageValue);
+                        reliableTopic.publish(messageValue);
+                        allPublished.countDown();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }, "publisher-" + i);
+                publishThreads.add(t);
             }
-            exec.shutdown();
-            assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS));
-
-            InternalSerializationService ss = Accessors.getSerializationService(hz);
-            List<Integer> messagesInSequenceOrder = new ArrayList<>();
-            long headSequence = ringbuffer.headSequence();
-            long tailSequence = ringbuffer.tailSequence();
-            for (long seq = headSequence; seq <= tailSequence; seq++) {
-                ReliableTopicMessage msg = ringbuffer.readOne(seq);
-                messagesInSequenceOrder.add(ss.toObject(msg.getPayload()));
-            }
-
-            assertEquals(messageCount, messagesInSequenceOrder.size());
             for (int i = 0; i < messageCount; i++) {
-                assertEquals(Integer.valueOf(i), messagesInSequenceOrder.get(i));
+                publishThreads.get(i).start();
+                Thread.sleep(5);
+            }
+            startBarrier.await();
+            assertTrue("Publishing timed out", allPublished.await(10, TimeUnit.SECONDS));
+
+            long timeout = System.currentTimeMillis() + 5000;
+            while (messageToSequence.size() < messageCount && System.currentTimeMillis() < timeout) {
+                Thread.sleep(10);
+            }
+            assertEquals(messageCount, messageToSequence.size());
+
+            List<Long> sequencesInSubmissionOrder = submissionOrder.stream()
+                    .map(messageToSequence::get)
+                    .collect(Collectors.toList());
+            for (int i = 0; i < sequencesInSubmissionOrder.size(); i++) {
+                assertNotNull("Missing sequence for message " + submissionOrder.get(i), sequencesInSubmissionOrder.get(i));
+            }
+            for (int i = 1; i < sequencesInSubmissionOrder.size(); i++) {
+                assertTrue(
+                        String.format("Sequence for message %d (%d) should be greater than sequence for message %d (%d)",
+                                submissionOrder.get(i), sequencesInSubmissionOrder.get(i),
+                                submissionOrder.get(i - 1), sequencesInSubmissionOrder.get(i - 1)),
+                        sequencesInSubmissionOrder.get(i) > sequencesInSubmissionOrder.get(i - 1));
+            }
+            Long firstSeq = sequencesInSubmissionOrder.get(0);
+            for (int i = 0; i < sequencesInSubmissionOrder.size(); i++) {
+                assertEquals(Long.valueOf(firstSeq + i), sequencesInSubmissionOrder.get(i));
+            }
+
+            List<Integer> messagesInRingbufferOrder = new ArrayList<>();
+            long headSequence = originalRingbuffer.headSequence();
+            long tailSequence = originalRingbuffer.tailSequence();
+            for (long seq = headSequence; seq <= tailSequence; seq++) {
+                ReliableTopicMessage msg = originalRingbuffer.readOne(seq);
+                messagesInRingbufferOrder.add(ss.toObject(msg.getPayload()));
+            }
+            assertEquals(messageCount, messagesInRingbufferOrder.size());
+            for (int i = 0; i < messageCount; i++) {
+                assertEquals(submissionOrder.get(i), messagesInRingbufferOrder.get(i));
             }
         } finally {
             Hazelcast.shutdownAll();
