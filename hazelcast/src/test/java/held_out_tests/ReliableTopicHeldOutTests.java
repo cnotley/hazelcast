@@ -15,12 +15,16 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.stream.Collectors;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+
+import com.hazelcast.instance.impl.HazelcastInstanceProxy;
+import com.hazelcast.internal.serialization.InternalSerializationService;
 
 import static org.junit.Assert.*;
 
@@ -1412,5 +1416,329 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
         int unique = observed.size();
         int allowed = Math.max(limit, 1) * 2;
         assertTrue("Observed too many thread names (" + unique + "), expected <= " + allowed, unique <= allowed);
+    }
+
+    @Test
+    public void testReadBatchSizePreservedWithConcurrency() throws Exception {
+        String cluster = "c-readbatch-preserve";
+        String topic = uniqueTopic();
+        int readBatchSize = 5;
+        int maxConcurrentPublishes = 3;
+        int totalMessages = 25;
+
+        com.hazelcast.config.Config cfg = baseConfig(cluster);
+        cfg.addRingBufferConfig(rbConfig(topic, 64));
+
+        ReliableTopicConfig topicConfig = new ReliableTopicConfig(topic)
+                .setReadBatchSize(readBatchSize)
+                .setTopicOverloadPolicy(com.hazelcast.topic.TopicOverloadPolicy.BLOCK)
+                .setStatisticsEnabled(true);
+        Method setter = ReliableTopicConfig.class.getDeclaredMethod("setMaxConcurrentPublishes", int.class);
+        setter.setAccessible(true);
+        setter.invoke(topicConfig, maxConcurrentPublishes);
+        cfg.addReliableTopicConfig(topicConfig);
+
+        com.hazelcast.core.HazelcastInstance hz = com.hazelcast.core.Hazelcast.newHazelcastInstance(cfg);
+        try {
+            com.hazelcast.topic.ITopic<Integer> reliableTopic = getTopic(hz, topic);
+
+            List<Integer> receivedMessages = Collections.synchronizedList(new ArrayList<>());
+            List<Integer> batchSizes = Collections.synchronizedList(new ArrayList<>());
+            AtomicInteger currentBatchSize = new AtomicInteger();
+            CountDownLatch allMessagesReceived = new CountDownLatch(totalMessages);
+            AtomicBoolean orderViolation = new AtomicBoolean();
+
+            reliableTopic.addMessageListener(new com.hazelcast.topic.ReliableMessageListener<Integer>() {
+                private long lastSequence = -1;
+                private int expectedNext = 0;
+
+                @Override
+                public long retrieveInitialSequence() {
+                    return -1;
+                }
+
+                @Override
+                public void storeSequence(long sequence) {
+                    if (lastSequence != -1 && sequence > lastSequence + 1) {
+                        if (currentBatchSize.get() > 0) {
+                            batchSizes.add(currentBatchSize.getAndSet(0));
+                        }
+                    }
+                    lastSequence = sequence;
+                }
+
+                @Override
+                public boolean isLossTolerant() {
+                    return false;
+                }
+
+                @Override
+                public boolean isTerminal(Throwable failure) {
+                    return false;
+                }
+
+                @Override
+                public void onMessage(com.hazelcast.topic.Message<Integer> message) {
+                    Integer value = message.getMessageObject();
+                    receivedMessages.add(value);
+                    if (value != expectedNext) {
+                        orderViolation.set(true);
+                    }
+                    expectedNext++;
+                    currentBatchSize.incrementAndGet();
+                    allMessagesReceived.countDown();
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+
+            ExecutorService publisherPool = Executors.newFixedThreadPool(3);
+            List<Future<?>> publishFutures = new ArrayList<>();
+            for (int i = 0; i < totalMessages; i++) {
+                final int messageValue = i;
+                publishFutures.add(publisherPool.submit(() -> reliableTopic.publish(messageValue)));
+            }
+            for (Future<?> future : publishFutures) {
+                future.get(5, TimeUnit.SECONDS);
+            }
+            publisherPool.shutdown();
+
+            assertTrue(allMessagesReceived.await(10, TimeUnit.SECONDS));
+            if (currentBatchSize.get() > 0) {
+                batchSizes.add(currentBatchSize.get());
+            }
+
+            assertEquals(totalMessages, receivedMessages.size());
+            assertFalse(orderViolation.get());
+            for (int i = 0; i < totalMessages; i++) {
+                assertEquals(Integer.valueOf(i), receivedMessages.get(i));
+            }
+            for (int i = 0; i < batchSizes.size() - 1; i++) {
+                assertTrue(batchSizes.get(i) <= readBatchSize);
+            }
+        } finally {
+            com.hazelcast.core.Hazelcast.shutdownAll();
+        }
+    }
+
+    @Test
+    public void testRingbufferSequenceMatchesSubmissionOrder() throws Exception {
+        String cluster = "c-ringbuffer-sequence";
+        String topic = uniqueTopic();
+        int maxConcurrentPublishes = 4;
+        int messageCount = 20;
+
+        com.hazelcast.config.Config cfg = baseConfig(cluster);
+        cfg.addRingBufferConfig(rbConfig(topic, 256));
+        cfg.addReliableTopicConfig(rtConfig(topic, maxConcurrentPublishes,
+                com.hazelcast.topic.TopicOverloadPolicy.BLOCK));
+
+        com.hazelcast.core.HazelcastInstance hz = com.hazelcast.core.Hazelcast.newHazelcastInstance(cfg);
+        try {
+            com.hazelcast.topic.ITopic<Integer> reliableTopic = getTopic(hz, topic);
+            com.hazelcast.ringbuffer.Ringbuffer<Object> ringbuffer = hz.getRingbuffer("_hz_rb_" + topic);
+
+            ExecutorService pool = Executors.newFixedThreadPool(maxConcurrentPublishes);
+            for (int i = 0; i < messageCount; i++) {
+                final int messageValue = i;
+                pool.submit(() -> reliableTopic.publish(messageValue));
+            }
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+
+            long headSequence = ringbuffer.headSequence();
+            long tailSequence = ringbuffer.tailSequence();
+            assertEquals(messageCount, tailSequence - headSequence + 1);
+
+            List<Long> sequenceNumbers = new ArrayList<>();
+            List<Integer> messagesInSequenceOrder = new ArrayList<>();
+            InternalSerializationService ss = ((HazelcastInstanceProxy) hz).getSerializationService();
+            for (long seq = headSequence; seq <= tailSequence; seq++) {
+                Object item = ringbuffer.readOne(seq);
+                if (item instanceof com.hazelcast.topic.impl.reliable.ReliableTopicMessage) {
+                    com.hazelcast.topic.impl.reliable.ReliableTopicMessage msg =
+                            (com.hazelcast.topic.impl.reliable.ReliableTopicMessage) item;
+                    messagesInSequenceOrder.add((Integer) ss.toObject(msg.getPayload()));
+                    sequenceNumbers.add(seq);
+                }
+            }
+
+            assertEquals(messageCount, messagesInSequenceOrder.size());
+            for (int i = 0; i < messageCount; i++) {
+                assertEquals(Integer.valueOf(i), messagesInSequenceOrder.get(i));
+            }
+            for (int i = 1; i < sequenceNumbers.size(); i++) {
+                assertTrue(sequenceNumbers.get(i) > sequenceNumbers.get(i - 1));
+            }
+        } finally {
+            com.hazelcast.core.Hazelcast.shutdownAll();
+        }
+    }
+
+    @Test
+    public void testPublishOperationsUseConfiguredExecutor() throws Exception {
+        String executorPrefix = "custom-publish-exec-";
+        AtomicInteger threadCounter = new AtomicInteger();
+        Set<String> publishThreadNames = Collections.synchronizedSet(new HashSet<>());
+
+        ThreadPoolExecutor customExecutor = new ThreadPoolExecutor(
+                2, 2, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(100),
+                r -> {
+                    Thread t = new Thread(r);
+                    t.setName(executorPrefix + threadCounter.incrementAndGet());
+                    t.setDaemon(true);
+                    return t;
+                }
+        );
+
+        int maxConcurrentPublishes = 3;
+        ReliableTopicConfig topicConfig = newConfigWithLimit(maxConcurrentPublishes);
+        topicConfig.setExecutor(customExecutor);
+
+        Object concurrencyManager = newManager(topicConfig);
+
+        AtomicInteger operationsExecuted = new AtomicInteger();
+        List<CompletableFuture<String>> threadTrackers = new ArrayList<>();
+
+        for (int i = 0; i < 10; i++) {
+            CompletableFuture<String> tracker = new CompletableFuture<>();
+            threadTrackers.add(tracker);
+            Method submitMethod = findScheduleMethod(concurrencyManager.getClass());
+            assertNotNull(submitMethod);
+            Class<?> paramType = submitMethod.getParameterTypes()[0];
+            Object operation;
+            if (Supplier.class.isAssignableFrom(paramType)) {
+                operation = (Supplier<CompletionStage<?>>) () -> {
+                    String threadName = Thread.currentThread().getName();
+                    publishThreadNames.add(threadName);
+                    operationsExecuted.incrementAndGet();
+                    tracker.complete(threadName);
+                    CompletableFuture<Void> result = new CompletableFuture<>();
+                    try {
+                        Thread.sleep(50);
+                        result.complete(null);
+                    } catch (InterruptedException e) {
+                        result.completeExceptionally(e);
+                    }
+                    return result;
+                };
+            } else if (Callable.class.isAssignableFrom(paramType)) {
+                operation = (Callable<CompletionStage<?>>) () -> {
+                    String threadName = Thread.currentThread().getName();
+                    publishThreadNames.add(threadName);
+                    operationsExecuted.incrementAndGet();
+                    tracker.complete(threadName);
+                    CompletableFuture<Void> result = new CompletableFuture<>();
+                    result.complete(null);
+                    return result;
+                };
+            } else {
+                fail("Unsupported parameter type for submit method: " + paramType);
+                return;
+            }
+            submitMethod.invoke(concurrencyManager, operation);
+        }
+
+        for (CompletableFuture<String> tracker : threadTrackers) {
+            tracker.get(5, TimeUnit.SECONDS);
+        }
+        assertTrue(awaitQuiescence(concurrencyManager, Duration.ofSeconds(5)));
+
+        assertEquals(10, operationsExecuted.get());
+        for (String threadName : publishThreadNames) {
+            assertTrue(threadName.startsWith(executorPrefix));
+        }
+        assertTrue(publishThreadNames.size() <= 2);
+        Set<String> nonCustomThreads = publishThreadNames.stream()
+                .filter(name -> !name.startsWith(executorPrefix))
+                .collect(Collectors.toSet());
+        assertTrue(nonCustomThreads.isEmpty());
+
+        customExecutor.shutdown();
+        assertTrue(customExecutor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception {
+        int maxConcurrentPublishes = 3;
+        ReliableTopicConfig topicConfig = newConfigWithLimit(maxConcurrentPublishes);
+        assertNull(topicConfig.getExecutor());
+
+        Object concurrencyManager = newManager(topicConfig);
+
+        Set<String> threadNamesUsed = Collections.synchronizedSet(new HashSet<>());
+        AtomicInteger completedOperations = new AtomicInteger();
+        List<CompletableFuture<Void>> operationFutures = new ArrayList<>();
+
+        for (int i = 0; i < 15; i++) {
+            CompletableFuture<Void> opFuture = new CompletableFuture<>();
+            operationFutures.add(opFuture);
+            Method submitMethod = findScheduleMethod(concurrencyManager.getClass());
+            assertNotNull(submitMethod);
+            Class<?> paramType = submitMethod.getParameterTypes()[0];
+            Object operation;
+            if (Supplier.class.isAssignableFrom(paramType)) {
+                operation = (Supplier<CompletionStage<?>>) () -> {
+                    String threadName = Thread.currentThread().getName();
+                    threadNamesUsed.add(threadName);
+                    try {
+                        Thread.sleep(20);
+                        completedOperations.incrementAndGet();
+                        opFuture.complete(null);
+                        return CompletableFuture.completedFuture(null);
+                    } catch (InterruptedException e) {
+                        opFuture.completeExceptionally(e);
+                        return CompletableFuture.failedFuture(e);
+                    }
+                };
+            } else {
+                fail("Unsupported parameter type: " + paramType);
+                return;
+            }
+            submitMethod.invoke(concurrencyManager, operation);
+        }
+
+        for (CompletableFuture<Void> future : operationFutures) {
+            future.get(5, TimeUnit.SECONDS);
+        }
+
+        assertEquals(15, completedOperations.get());
+        for (String threadName : threadNamesUsed) {
+            assertFalse(threadName.contains("main"));
+            assertFalse(threadName.contains("custom-") || threadName.contains("rt-test-exec-"));
+        }
+        assertTrue(threadNamesUsed.size() <= 10);
+        if (maxConcurrentPublishes > 1) {
+            assertTrue(threadNamesUsed.size() > 1);
+        }
+
+        String cluster = "c-fallback-shared";
+        String topic = uniqueTopic();
+
+        com.hazelcast.config.Config hzConfig = baseConfig(cluster);
+        ReliableTopicConfig hzTopicConfig = new ReliableTopicConfig(topic)
+                .setTopicOverloadPolicy(com.hazelcast.topic.TopicOverloadPolicy.BLOCK);
+        Method setter = ReliableTopicConfig.class.getDeclaredMethod("setMaxConcurrentPublishes", int.class);
+        setter.setAccessible(true);
+        setter.invoke(hzTopicConfig, maxConcurrentPublishes);
+        hzConfig.addReliableTopicConfig(hzTopicConfig);
+        hzConfig.addRingBufferConfig(rbConfig(topic, 64));
+
+        com.hazelcast.core.HazelcastInstance hz = com.hazelcast.core.Hazelcast.newHazelcastInstance(hzConfig);
+        try {
+            com.hazelcast.topic.ITopic<String> reliableTopic = getTopic(hz, topic);
+            CountDownLatch messagesReceived = new CountDownLatch(5);
+            reliableTopic.addMessageListener(msg -> messagesReceived.countDown());
+            for (int i = 0; i < 5; i++) {
+                reliableTopic.publish("message-" + i);
+            }
+            assertTrue(messagesReceived.await(5, TimeUnit.SECONDS));
+        } finally {
+            com.hazelcast.core.Hazelcast.shutdownAll();
+        }
     }
 }
