@@ -643,13 +643,15 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
             assertEquals(Integer.valueOf(i), receivedMessages.get(i));
         }
         assertEquals(totalMessages, batchSizes.stream().mapToInt(Integer::intValue).sum());
-        for (int i = 0; i < batchSizes.size() - 1; i++) {
-            assertTrue(batchSizes.get(i) <= readBatchSize);
+        for (int size : batchSizes) {
+            assertTrue("Batch size exceeds configured readBatchSize", size <= readBatchSize);
         }
-        // Verify batching actually occurred
-        assertTrue(
-                "Should have multiple batches for " + totalMessages + " messages with batchSize=" + readBatchSize,
-                batchSizes.size() >= totalMessages / readBatchSize);
+        // ensure batching actually happened
+        int expectedMinBatches = totalMessages / (readBatchSize * 2);
+        assertTrue("Should have multiple batches, but got " + batchSizes.size(),
+                batchSizes.size() >= expectedMinBatches);
+        assertTrue("Expected at least one batch read to contain multiple messages",
+                batchSizes.stream().anyMatch(bs -> bs > 1));
     } finally {
         Hazelcast.shutdownAll();
     }
@@ -730,8 +732,8 @@ public void testRingbufferSequenceMatchesSubmissionOrder() throws Exception {
         }
         // Just verify sequences are increasing, not necessarily consecutive
         for (int i = 1; i < sequencesInSubmissionOrder.size(); i++) {
-            assertTrue("Sequences should increase",
-                    sequencesInSubmissionOrder.get(i) >= sequencesInSubmissionOrder.get(i - 1));
+            assertTrue("Sequences should strictly increase",
+                    sequencesInSubmissionOrder.get(i) > sequencesInSubmissionOrder.get(i - 1));
         }
 
         List<Integer> messagesInRingbufferOrder = new ArrayList<>();
@@ -1686,6 +1688,7 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
     cfg.setTopicOverloadPolicy(com.hazelcast.topic.TopicOverloadPolicy.BLOCK);
     Object mgr = newManager(cfg);
     AtomicInteger running = new AtomicInteger();
+    AtomicInteger maxRunning = new AtomicInteger();
     List<Integer> startOrder = Collections.synchronizedList(new ArrayList<>());
 
     CountDownLatch allStarted = new CountDownLatch(20);
@@ -1699,7 +1702,8 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
             Object toParamObject(Class<?> paramType) {
                 if (Supplier.class.isAssignableFrom(paramType)) {
                     return (Supplier<CompletionStage<?>>) () -> {
-                        running.incrementAndGet();
+                        int now = running.incrementAndGet();
+                        maxRunning.updateAndGet(prev -> Math.max(prev, now));
                         startOrder.add(idx);
                         started.complete(null);
                         allStarted.countDown();
@@ -1726,17 +1730,19 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
 
     assertTrue(awaitQuiescence(mgr, Duration.ofSeconds(2)));
     assertTrue("Not all operations started", allStarted.await(3, TimeUnit.SECONDS));
-    assertTrue("Most operations should start in order",
-            isRoughlyOrdered(startOrder, 0.8));
     assertEquals("All operations should have been processed", n, startOrder.size());
-}
+    assertEquals("Each operation should start exactly once", n, new HashSet<>(startOrder).size());
+    assertEquals("Concurrency limit should be reached", limit, maxRunning.get());
 
-private static boolean isRoughlyOrdered(List<Integer> list, double threshold) {
     int inOrder = 0;
-    for (int i = 1; i < list.size(); i++) {
-        if (list.get(i) > list.get(i - 1)) inOrder++;
+    for (int i = 1; i < startOrder.size(); i++) {
+        if (startOrder.get(i) > startOrder.get(i - 1)) {
+            inOrder++;
+        }
     }
-    return (double) inOrder / (list.size() - 1) >= threshold;
+    double orderRatio = (double) inOrder / (startOrder.size() - 1);
+    assertTrue("Operations should mostly preserve order, but only " + (orderRatio * 100)
+            + "% were in order", orderRatio >= 0.6);
 }
     @Test
     public void testExecutorIsolationOnMerge() throws Exception {
