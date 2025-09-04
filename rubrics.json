@@ -1,0 +1,7 @@
+[
+  {
+    "index": 27,
+    "criterion": "All publishing operations including retry/backoff isolated to configured executor",
+    "weight": 8
+  }
+]

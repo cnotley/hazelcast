@@ -705,6 +705,43 @@ public void testRingbufferSequenceMatchesSubmissionOrder() throws Exception {
                         });
         ringbufferField.set(topicProxy, proxyRingbuffer);
 
+        // Add retry-inducing behavior to the proxy
+        AtomicInteger attemptCounter = new AtomicInteger();
+        Ringbuffer<ReliableTopicMessage> retryInducingRingbuffer =
+                (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                        proxyRingbuffer.getClass().getClassLoader(),
+                        new Class[]{Ringbuffer.class},
+                        (p, m, args) -> {
+                            String methodName = m.getName();
+
+                            // For first few add attempts, randomly fail to force retry
+                            if (("addAsync".equals(methodName) || "addAllAsync".equals(methodName))
+                                    && attemptCounter.incrementAndGet() <= 10) {
+                                if (Math.random() < 0.4) { // 40% chance of retry
+                                    // Return -1 to trigger retry logic
+                                    CompletableFuture<Long> retryNeeded = new CompletableFuture<>();
+                                    retryNeeded.complete(-1L);
+
+                                    // Schedule delayed success
+                                    CompletableFuture.delayedExecutor(50, TimeUnit.MILLISECONDS)
+                                            .execute(() -> {
+                                                // On retry, delegate to actual proxy
+                                                try {
+                                                    m.invoke(proxyRingbuffer, args);
+                                                } catch (Exception e) {
+                                                    // Ignore
+                                                }
+                                            });
+                                    return retryNeeded;
+                                }
+                            }
+
+                            // Normal delegation to tracking proxy
+                            return m.invoke(proxyRingbuffer, args);
+                        });
+
+        ringbufferField.set(topicProxy, retryInducingRingbuffer);
+
         List<Integer> submissionOrder = Collections.synchronizedList(new ArrayList<>());
         List<Future<?>> publishFutures = new ArrayList<>();
         ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -746,6 +783,17 @@ public void testRingbufferSequenceMatchesSubmissionOrder() throws Exception {
         assertEquals(messageCount, messagesInRingbufferOrder.size());
         for (int i = 0; i < messageCount; i++) {
             assertEquals(submissionOrder.get(i), messagesInRingbufferOrder.get(i));
+        }
+
+        // Additional verification: ensure no sequence gaps or inversions
+        long firstSeq = sequencesInSubmissionOrder.get(0);
+        for (int i = 0; i < sequencesInSubmissionOrder.size(); i++) {
+            long expectedSeq = firstSeq + i;
+            long actualSeq = sequencesInSubmissionOrder.get(i);
+            assertEquals("Sequence gap detected at position " + i +
+                            " (message " + submissionOrder.get(i) + "): " +
+                            "expected seq " + expectedSeq + " but got " + actualSeq,
+                    expectedSeq, actualSeq);
         }
     } finally {
         Hazelcast.shutdownAll();
@@ -980,58 +1028,103 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
 
     @Test
     public void testOutOfOrderCompletionsNoViolation() throws Exception {
-        int limit = 3;
-        ReliableTopicConfig cfg = newConfigWithLimit(limit);
-        Object mgr = newManager(cfg);
+        Assume.assumeNotNull(maxConcurrentPublishesSetter());
 
-        AtomicInteger running = new AtomicInteger();
-        List<Integer> startOrder = Collections.synchronizedList(new ArrayList<>());
+        String cluster = "c-out-of-order-retry";
+        String topic = uniqueTopic();
+        int maxConcurrentPublishes = 3;
 
-        final int N = 8;
-        List<ControlledOp> ops = new ArrayList<>();
-        for (int i = 0; i < N; i++) {
-            final int idx = i;
-            ops.add(new ControlledOp(idx, running) {
-                @Override
-                Object toParamObject(Class<?> paramType) {
-                    if (Supplier.class.isAssignableFrom(paramType)) {
-                        return (Supplier<CompletionStage<?>>) () -> {
-                            running.incrementAndGet();
-                            startOrder.add(idx);
-                            started.complete(null);
-                            return done.whenComplete((r, t) -> running.decrementAndGet());
-                        };
+        // Create config with small ringbuffer to force contention
+        Config cfg = baseConfig(cluster);
+        cfg.addRingBufferConfig(new RingbufferConfig(topic)
+                .setCapacity(2)  // Very small to force retry scenarios
+                .setTimeToLiveSeconds(0));
+
+        ReliableTopicConfig topicConfig = new ReliableTopicConfig(topic)
+                .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK);
+        maxConcurrentPublishesSetter().invoke(topicConfig, maxConcurrentPublishes);
+        cfg.addReliableTopicConfig(topicConfig);
+
+        HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
+        try {
+            ITopic<Integer> reliableTopic = getTopic(hz, topic);
+
+            // Track actual ringbuffer sequences
+            ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) reliableTopic;
+            Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
+            rbField.setAccessible(true);
+            Ringbuffer<ReliableTopicMessage> ringbuffer =
+                    (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
+
+            // Pre-fill ringbuffer to capacity
+            reliableTopic.publish(-1);
+            reliableTopic.publish(-2);
+
+            // Now submit operations that will experience retry
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            CountDownLatch allStarted = new CountDownLatch(5);
+            AtomicBoolean violationDetected = new AtomicBoolean(false);
+
+            for (int i = 0; i < 5; i++) {
+                final int value = i;
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    allStarted.countDown();
+                    try {
+                        // This will trigger retry logic due to full ringbuffer
+                        reliableTopic.publish(value);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
                     }
-                    return super.toParamObject(paramType);
-                }
-            });
-        }
-
-        scheduleN(mgr, ops.size(), ops);
-
-        for (int i = 0; i < Math.min(limit, N); i++) {
-            ops.get(i).started.get(1000, TimeUnit.MILLISECONDS);
-        }
-
-        int i = limit - 1;
-        while (i >= 0) {
-            ops.get(i).done.complete(null);
-            int next = limit + (limit - 1 - i);
-            if (next < N) {
-                ops.get(next).started.get(1000, TimeUnit.MILLISECONDS);
+                });
+                futures.add(future);
             }
-            i--;
+
+            // Wait for all to start attempting
+            assertTrue("Not all operations started", allStarted.await(2, TimeUnit.SECONDS));
+
+            // Clear space gradually to allow retry completions
+            Thread.sleep(100);
+
+            // Read and clear old entries to make space
+            ringbuffer.readOne(0);
+            Thread.sleep(50);
+            ringbuffer.readOne(1);
+
+            // Wait for all publishes to complete
+            for (CompletableFuture<Void> f : futures) {
+                f.get(10, TimeUnit.SECONDS);
+            }
+
+            // Verify ringbuffer contains values in submission order
+            long head = ringbuffer.headSequence();
+            long tail = ringbuffer.tailSequence();
+            List<Integer> actualOrder = new ArrayList<>();
+            InternalSerializationService ss = Accessors.getSerializationService(hz);
+
+            for (long seq = head; seq <= tail; seq++) {
+                ReliableTopicMessage msg = ringbuffer.readOne(seq);
+                Integer value = ss.toObject(msg.getPayload());
+                if (value >= 0) {  // Skip pre-fill values
+                    actualOrder.add(value);
+                }
+            }
+
+            // Check ordering
+            for (int i = 1; i < actualOrder.size(); i++) {
+                if (actualOrder.get(i) < actualOrder.get(i - 1)) {
+                    violationDetected.set(true);
+                    break;
+                }
+            }
+
+            assertFalse("Ringbuffer ordering violated during retry: " + actualOrder,
+                    violationDetected.get());
+            assertEquals("All values should be in ringbuffer",
+                    Arrays.asList(0, 1, 2, 3, 4), actualOrder);
+
+        } finally {
+            Hazelcast.shutdownAll();
         }
-
-        for (int k = N - 1; k >= limit; k--) {
-            ops.get(k).done.complete(null);
-        }
-
-        assertTrue(awaitQuiescence(mgr, Duration.ofSeconds(2)));
-
-        List<Integer> expected = new ArrayList<>();
-        for (int j = 0; j < N; j++) expected.add(j);
-        assertEquals("Start/dispatch order must not be violated by out-of-order completions", expected, startOrder);
     }
 
     @Test
@@ -1747,52 +1840,142 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
     @Test
     public void testExecutorIsolationOnMerge() throws Exception {
         String topic = uniqueTopic();
-        String cluster = "c-exec-iso";
-        com.hazelcast.config.Config cfg = baseConfig(cluster);
+        String cluster = "c-exec-iso-block";
 
-        cfg.addRingBufferConfig(rbConfig(topic, 32));
-        ThreadPoolExecutor pool = new ThreadPoolExecutor(
-                1, 1, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(64),
+        // Track ALL threads used during publishing
+        Set<String> publishThreadNames = Collections.synchronizedSet(new HashSet<>());
+
+        // Create custom executor that tracks thread usage
+        ThreadPoolExecutor customExecutor = new ThreadPoolExecutor(
+                2, 2, 0, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(64),
                 r -> {
-                    Thread t = new Thread(r);
-                    t.setName("merge-exec-1");
+                    Thread t = new Thread(() -> {
+                        // Wrap to track ANY execution on this thread
+                        publishThreadNames.add(Thread.currentThread().getName());
+                        r.run();
+                    });
+                    t.setName("custom-topic-executor-" + System.nanoTime());
                     t.setDaemon(true);
                     return t;
                 });
-        cfg.addReliableTopicConfig(rtConfig(topic, 1, com.hazelcast.topic.TopicOverloadPolicy.BLOCK)
-                .setExecutor(pool));
 
-        com.hazelcast.core.HazelcastInstance hz = com.hazelcast.core.Hazelcast.newHazelcastInstance(cfg);
+        Config cfg = baseConfig(cluster);
+        // Small ringbuffer to force BLOCK retry scenarios
+        cfg.addRingBufferConfig(new RingbufferConfig(topic)
+                .setCapacity(2)
+                .setTimeToLiveSeconds(0));
+
+        ReliableTopicConfig topicConfig = new ReliableTopicConfig(topic)
+                .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK)
+                .setExecutor(customExecutor);
+
+        // Set concurrent publishes if method exists
+        Method setter = maxConcurrentPublishesSetter();
+        if (setter != null) {
+            setter.invoke(topicConfig, 3);
+        }
+        cfg.addReliableTopicConfig(topicConfig);
+
+        HazelcastInstance hz1 = Hazelcast.newHazelcastInstance(cfg);
         try {
-            com.hazelcast.topic.ITopic<Integer> t = getTopic(hz, topic);
-            Set<String> threadsBefore = Collections.synchronizedSet(new HashSet<>());
-            CountDownLatch dl1 = new CountDownLatch(4);
-            t.addMessageListener((com.hazelcast.topic.MessageListener<Integer>) m -> {
-                threadsBefore.add(Thread.currentThread().getName());
-                dl1.countDown();
-            });
-            for (int i = 0; i < 4; i++) t.publish(i);
-            assertTrue(dl1.await(2, TimeUnit.SECONDS));
+            ITopic<String> reliableTopic = getTopic(hz1, topic);
 
-            com.hazelcast.core.Hazelcast.newHazelcastInstance(cfg).shutdown();
+            // Hook into the actual execution to track threads
+            ReliableTopicProxy<String> proxy = (ReliableTopicProxy<String>) reliableTopic;
+            Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
+            rbField.setAccessible(true);
+            Ringbuffer<ReliableTopicMessage> originalRb =
+                    (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
 
-            Set<String> threadsAfter = Collections.synchronizedSet(new HashSet<>());
-            CountDownLatch dl2 = new CountDownLatch(4);
-            t.addMessageListener((com.hazelcast.topic.MessageListener<Integer>) m -> {
-                threadsAfter.add(Thread.currentThread().getName());
-                dl2.countDown();
-            });
-            for (int i = 0; i < 4; i++) t.publish(100 + i);
-            assertTrue(dl2.await(2, TimeUnit.SECONDS));
+            // Wrap ringbuffer to track thread usage during retry
+            Ringbuffer<ReliableTopicMessage> wrappedRb =
+                    (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                            originalRb.getClass().getClassLoader(),
+                            new Class[]{Ringbuffer.class},
+                            (p, method, args) -> {
+                                // Track thread on EVERY ringbuffer operation
+                                String currentThread = Thread.currentThread().getName();
+                                publishThreadNames.add(currentThread);
 
-            assertFalse(threadsBefore.isEmpty());
-            assertFalse(threadsAfter.isEmpty());
-            for (String s : threadsBefore) assertTrue(s.startsWith("merge-exec-"));
-            for (String s : threadsAfter)  assertTrue(s.startsWith("merge-exec-"));
-            assertTrue(threadsBefore.size() <= 1 && threadsAfter.size() <= 1);
+                                // Force some retries by failing first attempts
+                                if ("addAsync".equals(method.getName()) ||
+                                        "addAllAsync".equals(method.getName())) {
+                                    if (Math.random() < 0.3) { // 30% chance to force retry
+                                        CompletableFuture<Long> failFuture = new CompletableFuture<>();
+                                        failFuture.complete(-1L); // Signal retry needed
+                                        return failFuture;
+                                    }
+                                }
+                                return method.invoke(originalRb, args);
+                            });
+            rbField.set(proxy, wrappedRb);
+
+            // Fill ringbuffer to trigger BLOCK scenarios
+            reliableTopic.publish("prefill-1");
+            reliableTopic.publish("prefill-2");
+
+            // Submit concurrent publishes that will need retry
+            ExecutorService testExecutor = Executors.newFixedThreadPool(5);
+            List<Future<?>> publishFutures = new ArrayList<>();
+
+            for (int i = 0; i < 10; i++) {
+                final String msg = "message-" + i;
+                publishFutures.add(testExecutor.submit(() -> {
+                    try {
+                        reliableTopic.publish(msg);
+                    } catch (Exception e) {
+                        // Log but don't fail - we're testing thread usage
+                    }
+                }));
+            }
+
+            // Let some operations retry
+            Thread.sleep(200);
+
+            // Clear space to allow completions
+            originalRb.readOne(originalRb.headSequence());
+
+            // Add second member to trigger merge scenario
+            HazelcastInstance hz2 = Hazelcast.newHazelcastInstance(cfg);
+
+            // Continue publishing during/after merge
+            for (int i = 10; i < 15; i++) {
+                final String msg = "post-merge-" + i;
+                publishFutures.add(testExecutor.submit(() -> {
+                    reliableTopic.publish(msg);
+                }));
+            }
+
+            // Wait for all publishes
+            for (Future<?> f : publishFutures) {
+                try {
+                    f.get(5, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    // Some may timeout due to BLOCK policy, that's ok
+                }
+            }
+
+            testExecutor.shutdown();
+
+            // CRITICAL CHECK: Verify ALL publish threads are from custom executor
+            Set<String> violatingThreads = new HashSet<>();
+            for (String threadName : publishThreadNames) {
+                if (!threadName.startsWith("custom-topic-executor-") &&
+                        !threadName.equals(Thread.currentThread().getName())) {
+                    violatingThreads.add(threadName);
+                }
+            }
+
+            assertTrue("Publishing operations used non-custom executor threads during " +
+                    "retry/backoff. Violating threads: " + violatingThreads +
+                    "\nAll threads used: " + publishThreadNames,
+                    violatingThreads.isEmpty());
+
+            hz2.shutdown();
         } finally {
-            com.hazelcast.core.Hazelcast.shutdownAll();
-            pool.shutdownNow();
+            customExecutor.shutdown();
+            Hazelcast.shutdownAll();
         }
     }
 
@@ -1842,6 +2025,95 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
         int unique = observed.size();
         int allowed = Math.max(limit, 1) * 2;
         assertTrue("Observed too many thread names (" + unique + "), expected <= " + allowed, unique <= allowed);
+    }
+
+    @Test
+    public void testBlockPolicyRetryUsesCorrectExecutor() throws Exception {
+        Assume.assumeNotNull(maxConcurrentPublishesSetter());
+
+        String topic = uniqueTopic();
+        String cluster = "c-block-retry-executor";
+
+        // Track threads used during retry
+        Set<String> retryThreads = Collections.synchronizedSet(new HashSet<>());
+        AtomicBoolean retryOccurred = new AtomicBoolean(false);
+
+        // Custom executor with identifiable threads
+        ThreadPoolExecutor customExecutor = new ThreadPoolExecutor(
+                1, 1, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                r -> new Thread(r, "block-retry-executor"));
+
+        Config cfg = baseConfig(cluster);
+        cfg.addRingBufferConfig(new RingbufferConfig(topic)
+                .setCapacity(1)); // Tiny to force retry
+
+        ReliableTopicConfig topicConfig = new ReliableTopicConfig(topic)
+                .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK)
+                .setExecutor(customExecutor);
+        maxConcurrentPublishesSetter().invoke(topicConfig, 2);
+        cfg.addReliableTopicConfig(topicConfig);
+
+        HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
+        try {
+            ITopic<String> reliableTopic = getTopic(hz, topic);
+
+            // Hook to track retry execution
+            ReliableTopicProxy<String> proxy = (ReliableTopicProxy<String>) reliableTopic;
+            Field nodeEngineField = proxy.getClass().getDeclaredField("nodeEngine");
+            nodeEngineField.setAccessible(true);
+            Object originalNodeEngine = nodeEngineField.get(proxy);
+
+            // Wrap nodeEngine to intercept schedule calls
+            Object wrappedNodeEngine = Proxy.newProxyInstance(
+                    originalNodeEngine.getClass().getClassLoader(),
+                    originalNodeEngine.getClass().getInterfaces(),
+                    (p, method, args) -> {
+                        if ("getExecutionService".equals(method.getName())) {
+                            // Return wrapped execution service that tracks usage
+                            Object originalExecService = method.invoke(originalNodeEngine, args);
+                            return Proxy.newProxyInstance(
+                                    originalExecService.getClass().getClassLoader(),
+                                    originalExecService.getClass().getInterfaces(),
+                                    (p2, m2, args2) -> {
+                                        if (m2.getName().contains("schedule")) {
+                                            retryOccurred.set(true);
+                                            retryThreads.add(Thread.currentThread().getName());
+                                            // Should use custom executor instead!
+                                            fail("Retry scheduled on wrong executor service");
+                                        }
+                                        return m2.invoke(originalExecService, args2);
+                                    });
+                        }
+                        return method.invoke(originalNodeEngine, args);
+                    });
+            nodeEngineField.set(proxy, wrappedNodeEngine);
+
+            // Fill ringbuffer
+            reliableTopic.publish("fill");
+
+            // This should retry
+            CompletableFuture<Void> pubFuture = CompletableFuture.runAsync(() -> {
+                reliableTopic.publish("retry-needed");
+            });
+
+            Thread.sleep(500); // Allow retry attempts
+
+            // Make space
+            Ringbuffer<?> rb = hz.getRingbuffer(topic);
+            rb.readOne(0);
+
+            pubFuture.get(5, TimeUnit.SECONDS);
+
+            if (retryOccurred.get()) {
+                assertTrue("Retry operations must use configured executor, but used: " +
+                                retryThreads, retryThreads.isEmpty());
+            }
+
+        } finally {
+            customExecutor.shutdown();
+            Hazelcast.shutdownAll();
+        }
     }
 
     @Test
