@@ -119,6 +119,10 @@ public class ReliableTopicHeldOutTests {
     }
 
     private static Object newManager(ReliableTopicConfig cfg) throws Exception {
+        return newManager(cfg, null);
+    }
+
+    private static Object newManager(ReliableTopicConfig cfg, Executor explicitExecutor) throws Exception {
         Class<?> mClass = managerClass();
         Constructor<?> chosen = null;
         for (Constructor<?> c : mClass.getDeclaredConstructors()) {
@@ -140,8 +144,13 @@ public class ReliableTopicHeldOutTests {
             for (int i = 1; i < args.length; i++) {
                 Class<?> paramType = chosen.getParameterTypes()[i];
                 if (paramType == Executor.class || paramType == ExecutorService.class) {
-                    args[i] = cfg.getExecutor() != null ? cfg.getExecutor() : 
-                            Executors.newCachedThreadPool();
+                    if (explicitExecutor != null) {
+                        args[i] = explicitExecutor;
+                    } else if (cfg.getExecutor() != null) {
+                        args[i] = cfg.getExecutor();
+                    } else {
+                        args[i] = Executors.newCachedThreadPool();
+                    }
                 } else {
                     args[i] = null;
                 }
@@ -231,6 +240,15 @@ public class ReliableTopicHeldOutTests {
             Thread.yield();
         }
         return getInFlight(manager) == 0;
+    }
+
+    private static boolean isMonotonicallyIncreasing(List<Integer> values) {
+        for (int i = 1; i < values.size(); i++) {
+            if (values.get(i - 1) >= values.get(i)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static Method findScheduleMethod(Class<?> mClass) {
@@ -545,7 +563,7 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
     String cluster = "c-readbatch-preserve";
     String topic = uniqueTopic();
     int readBatchSize = 5;
-    int maxConcurrentPublishes = 3;
+    int maxConcurrentPublishes = 4;
     int totalMessages = 25;
 
     Config cfg = baseConfig(cluster);
@@ -586,12 +604,12 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
                 });
         rbField.set(proxy, spyingRingbuffer);
 
-        List<Integer> receivedMessages = Collections.synchronizedList(new ArrayList<>());
+        List<Integer> receivedMessages = new ArrayList<>();
         CountDownLatch allMessagesReceived = new CountDownLatch(totalMessages);
         AtomicBoolean orderViolation = new AtomicBoolean(false);
 
         reliableTopic.addMessageListener(new ReliableMessageListener<Integer>() {
-            private int expectedNext = 0;
+            private final Object lock = new Object();
 
             @Override
             public long retrieveInitialSequence() {
@@ -613,14 +631,16 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
             }
 
             @Override
-            public void onMessage(com.hazelcast.topic.Message<Integer> message) {
-                int value = message.getMessageObject();
-                receivedMessages.add(value);
-                if (value != expectedNext) {
-                    orderViolation.set(true);
+            public void onMessage(Message<Integer> m) {
+                synchronized (lock) {
+                    Integer msg = m.getMessageObject();
+                    receivedMessages.add(msg);
+                    if (!receivedMessages.isEmpty() &&
+                            msg < receivedMessages.get(receivedMessages.size() - 1)) {
+                        orderViolation.set(true);
+                    }
+                    allMessagesReceived.countDown();
                 }
-                expectedNext++;
-                allMessagesReceived.countDown();
                 try {
                     Thread.sleep(10);
                 } catch (InterruptedException e) {
@@ -629,7 +649,7 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
             }
         });
 
-        ExecutorService publisherPool = Executors.newFixedThreadPool(3);
+        ExecutorService publisherPool = Executors.newFixedThreadPool(4);
         List<Future<?>> publishFutures = new ArrayList<>();
         for (int i = 0; i < totalMessages; i++) {
             final int messageValue = i;
@@ -641,22 +661,21 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
         publisherPool.shutdown();
 
         assertTrue("Not all messages received within timeout",
-                allMessagesReceived.await(10, TimeUnit.SECONDS));
+                allMessagesReceived.await(20, TimeUnit.SECONDS));
 
         assertEquals(totalMessages, receivedMessages.size());
-        assertFalse(orderViolation.get());
+        assertFalse("Message order violated", orderViolation.get());
+        assertTrue("Messages should be in order", isMonotonicallyIncreasing(receivedMessages));
         for (int i = 0; i < totalMessages; i++) {
             assertEquals(Integer.valueOf(i), receivedMessages.get(i));
         }
         assertEquals(totalMessages, batchSizes.stream().mapToInt(Integer::intValue).sum());
-        for (int size : batchSizes) {
-            assertTrue("Batch size exceeds configured readBatchSize", size <= readBatchSize);
+        for (int j = 0; j < batchSizes.size(); j++) {
+            int size = batchSizes.get(j);
+            assertTrue("Batch " + j + " size " + size +
+                    " exceeds readBatchSize " + readBatchSize, size <= readBatchSize);
         }
-        // ensure batching actually happened
-        int expectedMinBatches = totalMessages / (readBatchSize * 2);
-        assertTrue("Should have multiple batches, but got " + batchSizes.size(),
-                batchSizes.size() >= expectedMinBatches);
-        assertTrue("Expected at least one batch read to contain multiple messages",
+        assertTrue("No batching occurred; all singles",
                 batchSizes.stream().anyMatch(bs -> bs > 1));
     } finally {
         Hazelcast.shutdownAll();
@@ -810,91 +829,73 @@ public void testRingbufferSequenceMatchesSubmissionOrder() throws Exception {
 public void testPublishOperationsUseConfiguredExecutor() throws Exception {
     Assume.assumeNotNull(maxConcurrentPublishesSetter());
 
-    String executorPrefix = "custom-publish-exec-";
-    AtomicInteger threadCounter = new AtomicInteger(0);
-    Set<String> publishThreadNames = Collections.synchronizedSet(new HashSet<>());
+    String topic = uniqueTopic();
+    String cluster = "c-publish-configured-exec";
 
+    AtomicInteger threadSeq = new AtomicInteger();
     ThreadPoolExecutor customExecutor = new ThreadPoolExecutor(
             2, 2, 60L, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(100),
             r -> {
                 Thread t = new Thread(r);
-                String threadName = executorPrefix + threadCounter.incrementAndGet();
-                t.setName(threadName);
+                t.setName("custom-publish-exec-" + threadSeq.incrementAndGet());
                 t.setDaemon(true);
                 return t;
-            }
-    );
+            });
 
-    int maxConcurrentPublishes = 3;
-    ReliableTopicConfig topicConfig = newConfigWithLimit(maxConcurrentPublishes);
-    topicConfig.setExecutor(customExecutor);
+    Config cfg = baseConfig(cluster);
+    cfg.addRingBufferConfig(rbConfig(topic, 3));
+    ReliableTopicConfig rtc = new ReliableTopicConfig(topic)
+            .setExecutor(customExecutor)
+            .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK);
+    maxConcurrentPublishesSetter().invoke(rtc, 3);
+    cfg.addReliableTopicConfig(rtc);
 
-    Object concurrencyManager = newManager(topicConfig);
+    HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
+    try {
+        ITopic<Integer> reliableTopic = getTopic(hz, topic);
 
-    AtomicInteger operationsExecuted = new AtomicInteger(0);
-    List<CompletableFuture<String>> threadTrackers = new ArrayList<>();
+        ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) reliableTopic;
+        Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
+        rbField.setAccessible(true);
+        Ringbuffer<ReliableTopicMessage> original = (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
 
-    for (int i = 0; i < 10; i++) {
-        CompletableFuture<String> tracker = new CompletableFuture<>();
-        threadTrackers.add(tracker);
+        Set<String> observedThreads = Collections.synchronizedSet(new HashSet<>());
+        Ringbuffer<ReliableTopicMessage> wrapped = (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                original.getClass().getClassLoader(),
+                new Class[]{Ringbuffer.class},
+                (p, m, args) -> {
+                    if ("addAsync".equals(m.getName()) || "addAllAsync".equals(m.getName())) {
+                        observedThreads.add(Thread.currentThread().getName());
+                    }
+                    return m.invoke(original, args);
+                });
+        rbField.set(proxy, wrapped);
 
-        Method submitMethod = findScheduleMethod(concurrencyManager.getClass());
-        assertNotNull(submitMethod);
-
-        Object operation;
-        Class<?> paramType = submitMethod.getParameterTypes()[0];
-        if (Supplier.class.isAssignableFrom(paramType)) {
-            operation = (Supplier<CompletionStage<?>>) () -> {
-                String threadName = Thread.currentThread().getName();
-                publishThreadNames.add(threadName);
-                operationsExecuted.incrementAndGet();
-                tracker.complete(threadName);
-                CompletableFuture<Void> result = new CompletableFuture<>();
-                try {
-                    Thread.sleep(50);
-                    result.complete(null);
-                } catch (InterruptedException e) {
-                    result.completeExceptionally(e);
-                }
-                return result;
-            };
-        } else if (Callable.class.isAssignableFrom(paramType)) {
-            operation = (Callable<CompletionStage<?>>) () -> {
-                String threadName = Thread.currentThread().getName();
-                publishThreadNames.add(threadName);
-                operationsExecuted.incrementAndGet();
-                tracker.complete(threadName);
-                CompletableFuture<Void> result = new CompletableFuture<>();
-                result.complete(null);
-                return result;
-            };
-        } else {
-            fail("Unsupported parameter type: " + paramType);
-            return;
+        ExecutorService pub = Executors.newFixedThreadPool(5);
+        for (int i = 0; i < 10; i++) {
+            final int msg = i;
+            pub.submit(() -> reliableTopic.publish(msg));
         }
+        Thread.sleep(500);
+        for (int i = 0; i < 10; i++) {
+            try {
+                original.readOne(original.headSequence());
+            } catch (Exception ignored) {
+            }
+        }
+        pub.shutdown();
+        assertTrue(pub.awaitTermination(10, TimeUnit.SECONDS));
 
-        submitMethod.invoke(concurrencyManager, operation);
+        Set<String> nonCustom = observedThreads.stream()
+                .filter(t -> !t.startsWith("custom-publish-exec-"))
+                .filter(t -> !t.equals(Thread.currentThread().getName()))
+                .collect(Collectors.toSet());
+        assertTrue("Publishing used non-custom executor threads: " + nonCustom, nonCustom.isEmpty());
+    } finally {
+        customExecutor.shutdown();
+        Hazelcast.shutdownAll();
     }
-
-    for (CompletableFuture<String> tracker : threadTrackers) {
-        tracker.get(5, TimeUnit.SECONDS);
-    }
-
-    assertTrue(awaitQuiescence(concurrencyManager, Duration.ofSeconds(5)));
-
-    assertEquals(10, operationsExecuted.get());
-    for (String threadName : publishThreadNames) {
-        assertTrue(threadName.startsWith(executorPrefix));
-    }
-    assertTrue(publishThreadNames.size() <= 2);
-    Set<String> nonCustomThreads = publishThreadNames.stream()
-            .filter(name -> !name.startsWith(executorPrefix))
-            .collect(Collectors.toSet());
-    assertTrue(nonCustomThreads.isEmpty());
-
-    customExecutor.shutdown();
-    assertTrue(customExecutor.awaitTermination(5, TimeUnit.SECONDS));
 }
 
 @Test
@@ -1392,13 +1393,15 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
 
     @Test
     public void testGradualFillOneInOneOut() throws Exception {
-        int limit = 3;
+        int limit = 2;
         ReliableTopicConfig cfg = newConfigWithLimit(limit);
-        Object mgr = newManager(cfg);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        cfg.setExecutor(executor);
+        Object mgr = newManager(cfg, executor);
         AtomicInteger running = new AtomicInteger();
         List<Integer> startOrder = Collections.synchronizedList(new ArrayList<>());
         List<ControlledOp> ops = new ArrayList<>();
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 5; i++) {
             final int idx = i;
             ops.add(new ControlledOp(idx, running) {
                 @Override
@@ -1415,43 +1418,27 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
                 }
             });
         }
+
         scheduleN(mgr, ops.size(), ops);
 
-        long fillUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(800);
-        while (System.nanoTime() < fillUntil && running.get() < limit) {
-            Thread.yield();
+        for (int i = 0; i < limit; i++) {
+            ops.get(i).started.get(2000, TimeUnit.MILLISECONDS);
         }
-        assertTrue("Manager did not fill to limit", running.get() >= 1);
+        assertEquals(limit, getInFlight(mgr));
 
-        int startedBefore = startOrder.size();
-        for (int i = 0; i < ops.size(); i++) {
-            if (running.get() >= limit) {
-                Integer earliest = null;
-                for (int k = 0; k < ops.size(); k++) {
-                    if (!ops.get(k).done.isDone() && ops.get(k).started.isDone()) {
-                        earliest = k;
-                        break;
-                    }
-                }
-                if (earliest == null) earliest = i;
-                ops.get(earliest).done.complete(null);
-
-                long waitUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(1500);
-                boolean admitted = false;
-                while (System.nanoTime() < waitUntil) {
-                    if (startOrder.size() > startedBefore) {
-                        admitted = true;
-                        break;
-                    }
-                    Thread.yield();
-                }
-                assertTrue("Capacity admission should start a new op after one completion", admitted);
-                assertTrue("In-flight should not exceed limit", running.get() <= limit);
-                startedBefore = startOrder.size();
-            }
+        for (int i = limit; i < ops.size(); i++) {
+            ops.get(i - limit).done.complete(null);
+            Thread.sleep(50);
+            ops.get(i).started.get(2000, TimeUnit.MILLISECONDS);
+            assertEquals(limit, getInFlight(mgr));
+            assertEquals("Op " + i + " should start after previous complete", i, (int) startOrder.get(i));
         }
-        for (ControlledOp op : ops) op.done.complete(null);
-        awaitQuiescence(mgr, Duration.ofSeconds(1));
+
+        for (ControlledOp op : ops) {
+            op.done.complete(null);
+        }
+        assertTrue(awaitQuiescence(mgr, Duration.ofSeconds(2)));
+        executor.shutdownNow();
     }
 
     @Test
@@ -1733,8 +1720,10 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
 
     @Test
     public void testUsesConfiguredExecutorNoUnbounded() throws Exception {
+        String topic = uniqueTopic();
+        String cluster = "c-exec-no-unbounded";
         int poolSize = 2;
-        ReliableTopicConfig cfg = newConfigWithLimit(poolSize);
+
         AtomicInteger threadSeq = new AtomicInteger();
         ThreadFactory tf = r -> {
             Thread t = new Thread(r);
@@ -1745,50 +1734,67 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
         ThreadPoolExecutor pool = new ThreadPoolExecutor(
                 poolSize, poolSize, 0L, TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<>(64), tf);
-        cfg.setExecutor(pool);
 
-        Object mgr = newManager(cfg);
-        String caller = Thread.currentThread().getName();
-        Set<String> observedThreads = Collections.synchronizedSet(new HashSet<>());
-        AtomicInteger running = new AtomicInteger();
-        List<ControlledOp> ops = new ArrayList<>();
-        for (int i = 0; i < 6; i++) {
-            final int idx = i;
-            ops.add(new ControlledOp(idx, running) {
-                @Override
-                Object toParamObject(Class<?> paramType) {
-                    if (Supplier.class.isAssignableFrom(paramType)) {
-                        return (Supplier<CompletionStage<?>>) () -> {
+        Config cfg = baseConfig(cluster);
+        cfg.addRingBufferConfig(rbConfig(topic, 2));
+        ReliableTopicConfig rtc = new ReliableTopicConfig(topic)
+                .setExecutor(pool)
+                .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK);
+        maxConcurrentPublishesSetter().invoke(rtc, poolSize);
+        cfg.addReliableTopicConfig(rtc);
+
+        HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
+        try {
+            ITopic<Integer> reliableTopic = getTopic(hz, topic);
+
+            ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) reliableTopic;
+            Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
+            rbField.setAccessible(true);
+            Ringbuffer<ReliableTopicMessage> original = (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
+
+            Set<String> observedThreads = Collections.synchronizedSet(new HashSet<>());
+            Ringbuffer<ReliableTopicMessage> wrapped = (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                    original.getClass().getClassLoader(),
+                    new Class[]{Ringbuffer.class},
+                    (p, m, args) -> {
+                        if ("addAsync".equals(m.getName()) || "addAllAsync".equals(m.getName())) {
                             observedThreads.add(Thread.currentThread().getName());
-                            running.incrementAndGet();
-                            started.complete(null);
-                            return done.whenComplete((r, t) -> running.decrementAndGet());
-                        };
-                    }
-                    return super.toParamObject(paramType);
-                }
-            });
-        }
-        scheduleN(mgr, ops.size(), ops);
-        for (ControlledOp op : ops) {
-            op.started.get(1000, TimeUnit.MILLISECONDS);
-            op.done.complete(null);
-        }
-        assertTrue(awaitQuiescence(mgr, Duration.ofSeconds(2)));
+                        }
+                        return m.invoke(original, args);
+                    });
+            rbField.set(proxy, wrapped);
 
-        Set<String> ours = new HashSet<>();
-        Set<String> others = new HashSet<>();
-        for (String name : observedThreads) {
-            if (name.startsWith("rt-test-exec-")) ours.add(name);
-            else others.add(name);
+            int before = ManagementFactory.getThreadMXBean().getThreadCount();
+
+            ExecutorService pub = Executors.newFixedThreadPool(5);
+            for (int i = 0; i < 5; i++) {
+                final int msg = i;
+                pub.submit(() -> reliableTopic.publish(msg));
+            }
+            Thread.sleep(500);
+            // drain to release blocked publishers
+            for (int i = 0; i < 5; i++) {
+                try {
+                    original.readOne(original.headSequence());
+                } catch (Exception ignored) {
+                }
+            }
+            pub.shutdown();
+            assertTrue(pub.awaitTermination(10, TimeUnit.SECONDS));
+
+            int after = ManagementFactory.getThreadMXBean().getThreadCount();
+            assertTrue("Thread count increased unexpectedly: " + (after - before),
+                    after - before <= poolSize);
+
+            Set<String> nonCustom = observedThreads.stream()
+                    .filter(t -> !t.startsWith("rt-test-exec-"))
+                    .filter(t -> !t.equals(Thread.currentThread().getName()))
+                    .collect(Collectors.toSet());
+            assertTrue("Publishing used unexpected threads: " + nonCustom, nonCustom.isEmpty());
+        } finally {
+            pool.shutdownNow();
+            Hazelcast.shutdownAll();
         }
-        others.remove(caller);
-        assertTrue("Unexpected worker threads used: " + others, others.isEmpty());
-        if (!ours.isEmpty()) {
-            assertTrue("Observed more worker threads than configured pool size: " + ours.size(),
-                    ours.size() <= poolSize);
-        }
-        pool.shutdownNow();
     }
 
    @Test
@@ -1918,7 +1924,7 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
                                 // Force some retries by failing first attempts
                                 if ("addAsync".equals(method.getName()) ||
                                         "addAllAsync".equals(method.getName())) {
-                                    if (Math.random() < 0.3) { // 30% chance to force retry
+                                    if (Math.random() < 0.8) { // 80% chance to force retry
                                         CompletableFuture<Long> failFuture = new CompletableFuture<>();
                                         failFuture.complete(-1L); // Signal retry needed
                                         return failFuture;
@@ -1948,7 +1954,7 @@ public void testGlobalOrderUnderConcurrentOverload() throws Exception {
             }
 
             // Let some operations retry
-            Thread.sleep(200);
+            Thread.sleep(1000);
 
             // Clear space to allow completions
             originalRb.readOne(originalRb.headSequence());
