@@ -20,6 +20,7 @@ import com.hazelcast.topic.TopicOverloadException;
 import com.hazelcast.topic.TopicOverloadPolicy;
 import com.hazelcast.topic.impl.reliable.ReliableTopicMessage;
 import com.hazelcast.topic.impl.reliable.ReliableTopicProxy;
+import com.hazelcast.spi.impl.InternalCompletableFuture;
 
 import org.junit.Assume;
 import org.junit.Test;
@@ -35,7 +36,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1032,97 +1035,108 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
 
         String cluster = "c-out-of-order-retry";
         String topic = uniqueTopic();
-        int maxConcurrentPublishes = 3;
+        int messageCount = 10;
 
-        // Create config with small ringbuffer to force contention
         Config cfg = baseConfig(cluster);
         cfg.addRingBufferConfig(new RingbufferConfig(topic)
-                .setCapacity(2)  // Very small to force retry scenarios
+                .setCapacity(32)
                 .setTimeToLiveSeconds(0));
 
         ReliableTopicConfig topicConfig = new ReliableTopicConfig(topic)
                 .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK);
-        maxConcurrentPublishesSetter().invoke(topicConfig, maxConcurrentPublishes);
+        maxConcurrentPublishesSetter().invoke(topicConfig, messageCount);
         cfg.addReliableTopicConfig(topicConfig);
 
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
+        ExecutorService submitter = Executors.newSingleThreadExecutor();
         try {
-            ITopic<Integer> reliableTopic = getTopic(hz, topic);
+            ITopic<Integer> topicProxy = getTopic(hz, topic);
 
-            // Track actual ringbuffer sequences
-            ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) reliableTopic;
+            ReliableTopicProxy<Integer> proxy = (ReliableTopicProxy<Integer>) topicProxy;
             Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
             rbField.setAccessible(true);
-            Ringbuffer<ReliableTopicMessage> ringbuffer =
+            Ringbuffer<ReliableTopicMessage> original =
                     (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
 
-            // Pre-fill ringbuffer to capacity
-            reliableTopic.publish(-1);
-            reliableTopic.publish(-2);
-
-            // Now submit operations that will experience retry
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            CountDownLatch allStarted = new CountDownLatch(5);
-            AtomicBoolean violationDetected = new AtomicBoolean(false);
-
-            for (int i = 0; i < 5; i++) {
-                final int value = i;
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                    allStarted.countDown();
-                    try {
-                        // This will trigger retry logic due to full ringbuffer
-                        reliableTopic.publish(value);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-                futures.add(future);
-            }
-
-            // Wait for all to start attempting
-            assertTrue("Not all operations started", allStarted.await(2, TimeUnit.SECONDS));
-
-            // Clear space gradually to allow retry completions
-            Thread.sleep(100);
-
-            // Read and clear old entries to make space
-            ringbuffer.readOne(0);
-            Thread.sleep(50);
-            ringbuffer.readOne(1);
-
-            // Wait for all publishes to complete
-            for (CompletableFuture<Void> f : futures) {
-                f.get(10, TimeUnit.SECONDS);
-            }
-
-            // Verify ringbuffer contains values in submission order
-            long head = ringbuffer.headSequence();
-            long tail = ringbuffer.tailSequence();
-            List<Integer> actualOrder = new ArrayList<>();
             InternalSerializationService ss = Accessors.getSerializationService(hz);
 
+            class TrackingHandler implements InvocationHandler {
+                final Map<Integer, Integer> failPlan = new HashMap<>();
+                final Map<Integer, AtomicInteger> attempts = new ConcurrentHashMap<>();
+                final List<Integer> submissionOrder = Collections.synchronizedList(new ArrayList<>());
+                final List<Integer> completionOrder = Collections.synchronizedList(new ArrayList<>());
+
+                TrackingHandler() {
+                    failPlan.put(1, 1); // second message fails once
+                    failPlan.put(4, 2); // fifth message fails twice
+                }
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                    if (("addAllAsync".equals(method.getName()) || "addAsync".equals(method.getName()))
+                            && args.length >= 2) {
+                        ReliableTopicMessage msg;
+                        if ("addAllAsync".equals(method.getName())) {
+                            Collection<ReliableTopicMessage> coll = (Collection<ReliableTopicMessage>) args[0];
+                            msg = coll.iterator().next();
+                        } else {
+                            msg = (ReliableTopicMessage) args[0];
+                        }
+                        int value = ss.toObject(msg.getPayload());
+                        AtomicInteger attempt = attempts.computeIfAbsent(value, k -> new AtomicInteger());
+                        int n = attempt.incrementAndGet();
+                        if (n == 1) {
+                            submissionOrder.add(value);
+                        }
+                        int fails = failPlan.getOrDefault(value, 0);
+                        if (n <= fails) {
+                            return InternalCompletableFuture.newCompletedFuture(-1L);
+                        }
+                        InternalCompletableFuture<Long> fut =
+                                (InternalCompletableFuture<Long>) method.invoke(original, args);
+                        fut.whenComplete((seq, t) -> {
+                            if (t == null && seq != -1) {
+                                completionOrder.add(value);
+                            }
+                        });
+                        return fut;
+                    }
+                    return method.invoke(original, args);
+                }
+            }
+
+            TrackingHandler handler = new TrackingHandler();
+            Ringbuffer<ReliableTopicMessage> wrapped =
+                    (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
+                            Ringbuffer.class.getClassLoader(), new Class[]{Ringbuffer.class}, handler);
+            rbField.set(proxy, wrapped);
+
+            List<CompletionStage<Void>> stages = new ArrayList<>();
+            for (int i = 0; i < messageCount; i++) {
+                final int value = i;
+                CompletionStage<Void> stage = submitter
+                        .submit(() -> topicProxy.publishAsync(value))
+                        .get();
+                stages.add(stage);
+            }
+
+            for (CompletionStage<Void> stage : stages) {
+                stage.toCompletableFuture().get(10, TimeUnit.SECONDS);
+            }
+
+            List<Integer> ringbufferOrder = new ArrayList<>();
+            long head = original.headSequence();
+            long tail = original.tailSequence();
             for (long seq = head; seq <= tail; seq++) {
-                ReliableTopicMessage msg = ringbuffer.readOne(seq);
-                Integer value = ss.toObject(msg.getPayload());
-                if (value >= 0) {  // Skip pre-fill values
-                    actualOrder.add(value);
-                }
+                ReliableTopicMessage m = original.readOne(seq);
+                ringbufferOrder.add(ss.toObject(m.getPayload()));
             }
 
-            // Check ordering
-            for (int i = 1; i < actualOrder.size(); i++) {
-                if (actualOrder.get(i) < actualOrder.get(i - 1)) {
-                    violationDetected.set(true);
-                    break;
-                }
-            }
-
-            assertFalse("Ringbuffer ordering violated during retry: " + actualOrder,
-                    violationDetected.get());
-            assertEquals("All values should be in ringbuffer",
-                    Arrays.asList(0, 1, 2, 3, 4), actualOrder);
-
+            assertEquals(handler.submissionOrder, ringbufferOrder);
+            assertEquals(handler.submissionOrder.size(), handler.completionOrder.size());
+            assertNotEquals(handler.submissionOrder, handler.completionOrder);
         } finally {
+            submitter.shutdownNow();
             Hazelcast.shutdownAll();
         }
     }
