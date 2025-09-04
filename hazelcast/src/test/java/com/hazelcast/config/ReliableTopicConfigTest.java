@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.concurrent.Executor;
 
 import static com.hazelcast.config.ReliableTopicConfig.DEFAULT_READ_BATCH_SIZE;
+import static com.hazelcast.config.ReliableTopicConfig.DEFAULT_MAX_CONCURRENT_PUBLISHES;
 import static com.hazelcast.config.ReliableTopicConfig.DEFAULT_STATISTICS_ENABLED;
 import static com.hazelcast.config.ReliableTopicConfig.DEFAULT_TOPIC_OVERLOAD_POLICY;
 import static com.hazelcast.test.HazelcastTestSupport.assumeDifferentHashCodes;
@@ -55,6 +56,7 @@ public class ReliableTopicConfigTest {
         assertEquals("foo", config.getName());
         assertEquals(DEFAULT_TOPIC_OVERLOAD_POLICY, config.getTopicOverloadPolicy());
         assertEquals(DEFAULT_STATISTICS_ENABLED, config.isStatisticsEnabled());
+        assertEquals(ReliableTopicConfig.DEFAULT_MAX_CONCURRENT_PUBLISHES, config.getMaxConcurrentPublishes());
     }
 
     @Test
@@ -157,6 +159,21 @@ public class ReliableTopicConfigTest {
         config.addMessageListenerConfig(null);
     }
 
+    // ==================== setMaxConcurrentPublishes =============================
+
+    @Test
+    public void setMaxConcurrentPublishes() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(4);
+        assertEquals(4, config.getMaxConcurrentPublishes());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void setMaxConcurrentPublishes_invalid() {
+        ReliableTopicConfig config = new ReliableTopicConfig("foo");
+        config.setMaxConcurrentPublishes(0);
+    }
+
     @Test
     public void addMessageListenerConfig() {
         ReliableTopicConfig config = new ReliableTopicConfig("foo");
@@ -230,6 +247,12 @@ public class ReliableTopicConfigTest {
             fail();
         } catch (UnsupportedOperationException ignored) {
         }
+
+        try {
+            readOnly.setMaxConcurrentPublishes(4);
+            fail();
+        } catch (UnsupportedOperationException ignored) {
+        }
     }
 
     @Test
@@ -237,9 +260,9 @@ public class ReliableTopicConfigTest {
         ReliableTopicConfig config = new ReliableTopicConfig("foo");
 
         String s = config.toString();
-
-        assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null,"
-                + " readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null}", s);
+        assertEquals("ReliableTopicConfig{name='foo', topicOverloadPolicy=BLOCK, executor=null"
+                + ", readBatchSize=10, statisticsEnabled=true, listenerConfigs=[], userCodeNamespace=null"
+                + ", maxConcurrentPublishes=" + DEFAULT_MAX_CONCURRENT_PUBLISHES + "}", s);
     }
 
     @Test
