@@ -83,6 +83,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     final LocalTopicStatsImpl localTopicStats;
     final ReliableTopicConfig topicConfig;
     final TopicOverloadPolicy overloadPolicy;
+    final ReliableTopicConcurrencyManager concurrencyManager;
 
     private final NodeEngine nodeEngine;
     private final Address thisAddress;
@@ -99,6 +100,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         this.executor = initExecutor(nodeEngine, topicConfig);
         this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
+        this.concurrencyManager = new ReliableTopicConcurrencyManager(topicConfig);
         this.localTopicStats = service.getLocalTopicStats(name);
 
         for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
@@ -170,21 +172,28 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
         try {
             Data data = nodeEngine.toData(payload);
             ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
-            switch (overloadPolicy) {
-                case ERROR:
-                    addOrFail(message);
-                    break;
-                case DISCARD_OLDEST:
-                    addOrOverwrite(message);
-                    break;
-                case DISCARD_NEWEST:
-                    ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
-                    break;
-                case BLOCK:
-                    addWithBackoff(Collections.singleton(message));
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
+            ReliableTopicConcurrencyManager.Ticket ticket = concurrencyManager.begin();
+            try {
+                // Enforce strict publish sequencing for ringbuffer effects
+                concurrencyManager.awaitTurn(ticket);
+                switch (overloadPolicy) {
+                    case ERROR:
+                        addOrFail(message);
+                        break;
+                    case DISCARD_OLDEST:
+                        addOrOverwrite(message);
+                        break;
+                    case DISCARD_NEWEST:
+                        ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
+                        break;
+                    case BLOCK:
+                        addWithBackoff(Collections.singleton(message));
+                        break;
+                    default:
+                        throw new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy);
+                }
+            } finally {
+                concurrencyManager.complete(ticket);
             }
         } catch (Exception e) {
             throw (RuntimeException) peel(e, null,
@@ -267,6 +276,7 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
     @Override
     protected void postDestroy() {
         // this will trigger all listeners to destroy themselves.
+        concurrencyManager.reset();
         ringbuffer.destroy();
     }
 
@@ -386,5 +396,11 @@ public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTop
                 returnFuture.complete(null);
             }
         }, CALLER_RUNS);
+    }
+
+
+    // package-private accessor for tests and internal integration
+    ReliableTopicConcurrencyManager concurrencyManager() {
+        return concurrencyManager;
     }
 }
