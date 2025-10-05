@@ -29,7 +29,6 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -50,9 +49,11 @@ public final class ReliableTopicConcurrencyManager {
     private final ArrayDeque<PublishTask> queuedTasks = new ArrayDeque<>();
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition idleCondition = lock.newCondition();
+    private final Condition startCondition = lock.newCondition();
 
     private volatile int concurrencyLimit;
     private long sequenceGenerator;
+    private long nextSequenceToStart;
     private int inFlight;
 
     public ReliableTopicConcurrencyManager(@Nonnull ReliableTopicConfig topicConfig) {
@@ -171,6 +172,8 @@ public final class ReliableTopicConcurrencyManager {
     }
 
     private void executeTask(PublishTask task) {
+        awaitTurn(task);
+
         CompletionStage<?> stage;
         try {
             stage = task.operation.get();
@@ -194,6 +197,19 @@ public final class ReliableTopicConcurrencyManager {
             }
             onTaskFinished();
         });
+    }
+
+    private void awaitTurn(PublishTask task) {
+        lock.lock();
+        try {
+            while (task.sequence != nextSequenceToStart) {
+                startCondition.awaitUninterruptibly();
+            }
+            nextSequenceToStart++;
+            startCondition.signalAll();
+        } finally {
+            lock.unlock();
+        }
     }
 
     private void onTaskFinished() {
