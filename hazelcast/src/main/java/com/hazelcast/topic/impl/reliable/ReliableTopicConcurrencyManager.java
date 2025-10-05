@@ -172,11 +172,9 @@ public final class ReliableTopicConcurrencyManager {
     }
 
     private void executeTask(PublishTask task) {
-        awaitTurn(task);
-
         CompletionStage<?> stage;
         try {
-            stage = task.operation.get();
+            stage = invokeWhenTurn(task);
         } catch (Throwable t) {
             task.future.completeExceptionally(t);
             onTaskFinished();
@@ -199,16 +197,26 @@ public final class ReliableTopicConcurrencyManager {
         });
     }
 
-    private void awaitTurn(PublishTask task) {
+    private CompletionStage<?> invokeWhenTurn(PublishTask task) {
         lock.lock();
         try {
             while (task.sequence != nextSequenceToStart) {
                 startCondition.awaitUninterruptibly();
             }
             nextSequenceToStart++;
-            startCondition.signalAll();
         } finally {
             lock.unlock();
+        }
+
+        try {
+            return task.operation.get();
+        } finally {
+            lock.lock();
+            try {
+                startCondition.signalAll();
+            } finally {
+                lock.unlock();
+            }
         }
     }
 
