@@ -63,5 +63,10 @@ public class ReliableMessageRunner<E> extends MessageRunner<E> {
         return t;
     }
 
+    @Override
+    protected long getDroppedSequenceFloor() {
+        return proxy.firstDroppedSequence();
+    }
+
 
 }

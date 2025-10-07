@@ -85,6 +85,7 @@ import java.util.concurrent.atomic.AtomicLong;
     private final ConcurrentHashMap<Long, CommitTask> commitBuffer = new ConcurrentHashMap<>();
     private final AtomicLong nextCommitSequence = new AtomicLong();
     private final AtomicLong publishSequence = new AtomicLong();
+    private final AtomicLong firstDroppedSequence = new AtomicLong(Long.MIN_VALUE);
  
      public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                                ReliableTopicConfig topicConfig) {
@@ -148,6 +149,11 @@ import java.util.concurrent.atomic.AtomicLong;
      ReliableTopicConcurrencyManager concurrencyManager() {
          return concurrencyManager;
      }
+
+    long firstDroppedSequence() {
+        long value = firstDroppedSequence.get();
+        return value == Long.MIN_VALUE ? -1L : value;
+    }
  
      // --------------------------------------------------------------------------------------------
      // Single publish
@@ -294,8 +300,16 @@ import java.util.concurrent.atomic.AtomicLong;
     }
 
     private CompletionStage<Void> addAsyncOnExecutor(ReliableTopicMessage message, OverflowPolicy policy) {
-        System.err.println("addAsync invoked on thread: " + Thread.currentThread().getName());
-        return ringbuffer.addAsync(message, policy).thenApplyAsync(id -> null, executor);
+        CompletionStage<Void> waitStage = policy == OverflowPolicy.OVERWRITE
+                ? waitForListenerRecoveryIfNeeded()
+                : CompletableFuture.completedFuture(null);
+
+        return waitStage.thenCompose(v -> ringbuffer.addAsync(message, policy).thenApplyAsync(id -> {
+            if (policy == OverflowPolicy.OVERWRITE) {
+                recordFirstDroppedSequence(id);
+            }
+            return null;
+        }, executor));
     }
  
      private void attemptAddSingle(ReliableTopicMessage message, long pauseMillis, CompletableFuture<Void> overall) {
@@ -468,7 +482,9 @@ import java.util.concurrent.atomic.AtomicLong;
                      }
                      break;
                  case DISCARD_OLDEST:
-                     ringbuffer.addAllAsync(messages, OverflowPolicy.OVERWRITE).toCompletableFuture().get();
+                    long overwriteId = ringbuffer.addAllAsync(messages, OverflowPolicy.OVERWRITE)
+                            .toCompletableFuture().get();
+                    recordFirstDroppedSequence(overwriteId);
                      break;
                  case DISCARD_NEWEST:
                      ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
@@ -538,10 +554,13 @@ import java.util.concurrent.atomic.AtomicLong;
      private InternalCompletableFuture<Void> addAsync(List<ReliableTopicMessage> messages,
                                                       OverflowPolicy overflowPolicy) {
          InternalCompletableFuture<Void> returnFuture = new InternalCompletableFuture<>();
-         ringbuffer.addAllAsync(messages, overflowPolicy).whenCompleteAsync((id, t) -> {
+        ringbuffer.addAllAsync(messages, overflowPolicy).whenCompleteAsync((id, t) -> {
              if (t != null) {
                  returnFuture.completeExceptionally(t);
              } else {
+                if (overflowPolicy == OverflowPolicy.OVERWRITE && id != null) {
+                    recordFirstDroppedSequence(id);
+                }
                  returnFuture.complete(null);
              }
          }, CALLER_RUNS);
@@ -688,6 +707,65 @@ import java.util.concurrent.atomic.AtomicLong;
         CommitTask(long sequence, Supplier<CompletionStage<Void>> supplier) {
             this.sequence = sequence;
             this.supplier = supplier;
+        }
+    }
+
+    private void recordFirstDroppedSequence(long sequenceId) {
+        if (sequenceId < 0) {
+            return;
+        }
+        long capacity;
+        try {
+            capacity = ringbuffer.capacity();
+        } catch (Throwable t) {
+            return;
+        }
+        if (capacity <= 0) {
+            return;
+        }
+        long droppedSequence = sequenceId - capacity;
+        if (droppedSequence >= 0) {
+            firstDroppedSequence.compareAndSet(Long.MIN_VALUE, droppedSequence);
+        }
+    }
+
+    private CompletionStage<Void> waitForListenerRecoveryIfNeeded() {
+        long dropSeq = firstDroppedSequence();
+        if (dropSeq < 0) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        long capacity = ringbufferCapacity();
+        if (capacity <= 0) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        long threshold = dropSeq + capacity - 1;
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        checkListenerRecovery(dropSeq, threshold, future);
+        return future;
+    }
+
+    private void checkListenerRecovery(long dropSeq, long threshold, CompletableFuture<Void> future) {
+        if (future.isDone()) {
+            return;
+        }
+        long slowest = getSlowestListenerSequence();
+        if (slowest > threshold) {
+            firstDroppedSequence.compareAndSet(dropSeq, Long.MIN_VALUE);
+            future.complete(null);
+            return;
+        }
+        nodeEngine.getExecutionService().schedule(
+                () -> checkListenerRecovery(dropSeq, threshold, future),
+                5, MILLISECONDS);
+    }
+
+    private long ringbufferCapacity() {
+        try {
+            return ringbuffer.capacity();
+        } catch (Throwable t) {
+            return -1L;
         }
     }
  }

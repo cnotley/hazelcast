@@ -118,8 +118,13 @@ public abstract class MessageRunner<E> implements BiConsumer<ReadResultSet<Relia
             runWithNamespaceAwareness(() -> {
                 for (int i = 0; i < result.size(); i++) {
                     ReliableTopicMessage message = result.get(i);
+                    long messageSequence = result.getSequence(i);
+                    long dropFloor = getDroppedSequenceFloor();
+                    if (dropFloor >= 0 && messageSequence <= dropFloor) {
+                        continue;
+                    }
                     try {
-                        listener.storeSequence(result.getSequence(i));
+                        listener.storeSequence(messageSequence);
                         listener.onMessage(toMessage(message));
                     } catch (Throwable t) {
                         if (terminate(t)) {
@@ -151,6 +156,10 @@ public abstract class MessageRunner<E> implements BiConsumer<ReadResultSet<Relia
     }
 
     protected abstract Member getMember(ReliableTopicMessage m);
+
+    protected long getDroppedSequenceFloor() {
+        return -1L;
+    }
 
     /**
      * @param t throwable to check if it is terminal or can be handled so that topic can continue
