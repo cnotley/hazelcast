@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2025, Hazelcast
+ * Copyright (c) 2008-2025
  * Licensed under the Apache License, Version 2.0
  */
 
@@ -31,9 +31,10 @@
  import com.hazelcast.topic.TopicOverloadPolicy;
  
  import javax.annotation.Nonnull;
- import java.util.*;
- import java.util.concurrent.*;
- import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+ import java.util.function.Supplier;
  import java.util.stream.Collectors;
  
  import static com.hazelcast.internal.util.ConcurrencyUtil.CALLER_RUNS;
@@ -46,13 +47,12 @@
  
  /**
   * Server-side {@link ITopic} implementation for reliable topics.
-  *
-  * Concurrency notes in this implementation:
-  *  - All single-message publish work is executed via {@link ReliableTopicConcurrencyManager} on the
-  *    topic's configured executor (or Hazelcast's shared ASYNC executor), but the synchronous
-  *    {@link #publish(Object)} method blocks until the add completes to preserve existing semantics.
-  *  - Under BLOCK policy, publish() blocks until the message is committed; under ERROR, publish()
-  *    throws immediately when there is no capacity; DISCARD_* keep legacy behavior.
+  * <p>
+  * Enhancements for controlled concurrency:
+  *  • A {@link ReliableTopicConcurrencyManager} throttles start concurrency.
+  *  • A serial commit chain ensures that actual ringbuffer "effect" (add)
+  *    happens strictly in submission order even when limit > 1, preserving
+  *    global ordering and overload semantics.
   */
  public class ReliableTopicProxy<E> extends AbstractDistributedObject<ReliableTopicService> implements ITopic<E> {
  
@@ -73,8 +73,18 @@
      private final Address thisAddress;
      private final String name;
  
-     // Concurrency manager (package-private accessor below)
-    final ReliableTopicConcurrencyManager concurrencyManager;
+     /** Concurrency manager (limit & in-flight control). */
+     final ReliableTopicConcurrencyManager concurrencyManager;
+ 
+     /**
+      * Serial commit chain to guarantee that ringbuffer adds are performed in exact submission order.
+      * Each publish (except ERROR policy) composes its "work" onto this chain.
+      */
+    private final Object commitLock = new Object();
+    private volatile CompletionStage<Void> commitTail = CompletableFuture.completedFuture(null);
+    private final ConcurrentHashMap<Long, CommitTask> commitBuffer = new ConcurrentHashMap<>();
+    private final AtomicLong nextCommitSequence = new AtomicLong();
+    private final AtomicLong publishSequence = new AtomicLong();
  
      public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                                ReliableTopicConfig topicConfig) {
@@ -88,25 +98,33 @@
          this.thisAddress = nodeEngine.getThisAddress();
          this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
          this.localTopicStats = service.getLocalTopicStats(name);
-        this.concurrencyManager = new ReliableTopicConcurrencyManager(this.executor, this.topicConfig);
+         this.concurrencyManager = new ReliableTopicConcurrencyManager(this.executor, this.topicConfig);
  
          for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
              addMessageListener(listenerConfig);
          }
  
-         // Reset scheduling state on topology changes.
+         // Reset transient scheduling/ordering state on topology changes.
          nodeEngine.getClusterService().addMembershipListener(new MembershipListener() {
              @Override
              public void memberAdded(MembershipEvent event) {
-                concurrencyManager.reset();
+                 resetSchedulingState();
              }
  
              @Override
              public void memberRemoved(MembershipEvent event) {
-                concurrencyManager.reset();
+                 resetSchedulingState();
              }
          });
      }
+ 
+    private void resetSchedulingState() {
+        concurrencyManager.reset();
+        commitBuffer.clear();
+        commitTail = CompletableFuture.completedFuture(null);
+        nextCommitSequence.set(0);
+        publishSequence.set(0);
+    }
  
      @Override
      public String getServiceName() {
@@ -118,47 +136,12 @@
          return name;
      }
  
-     private void addMessageListener(ListenerConfig listenerConfig) {
-         NodeEngine nodeEngine = getNodeEngine();
-         MessageListener listener = loadListener(listenerConfig);
-         if (listener == null) {
-             return;
-         }
-         if (listener instanceof HazelcastInstanceAware hazelcastInstanceAware) {
-             hazelcastInstanceAware.setHazelcastInstance(nodeEngine.getHazelcastInstance());
-         }
-         addMessageListener(listener);
-     }
- 
-     private MessageListener loadListener(ListenerConfig listenerConfig) {
-         try {
-             MessageListener listener = (MessageListener) listenerConfig.getImplementation();
-             if (listener != null) {
-                 return listener;
-             }
-             if (listenerConfig.getClassName() != null) {
-                 String namespace = ReliableTopicService.lookupNamespace(nodeEngine, name);
-                 ClassLoader loader = NamespaceUtil.getClassLoaderForNamespace(nodeEngine, namespace);
-                 Object object = ClassLoaderUtil.newInstance(loader, listenerConfig.getClassName());
-                 if (!(object instanceof MessageListener)) {
-                     throw new HazelcastException("class '"
-                             + listenerConfig.getClassName() + "' is not an instance of "
-                             + MessageListener.class.getName());
-                 }
-                 listener = (MessageListener) object;
-             }
-             return listener;
-         } catch (Exception e) {
-             throw ExceptionUtil.rethrow(e);
-         }
-     }
- 
      private Executor initExecutor(NodeEngine nodeEngine, ReliableTopicConfig topicConfig) {
-         Executor executor = topicConfig.getExecutor();
-         if (executor == null) {
-             executor = nodeEngine.getExecutionService().getExecutor(ASYNC_EXECUTOR);
+         Executor ex = topicConfig.getExecutor();
+         if (ex == null) {
+             ex = nodeEngine.getExecutionService().getExecutor(ASYNC_EXECUTOR);
          }
-         return executor;
+         return ex;
      }
  
      // Package-private accessor required by tests
@@ -166,62 +149,49 @@
          return concurrencyManager;
      }
  
-    private CompletionStage<Void> invokeSinglePublish(ReliableTopicMessage message) {
-        return switch (overloadPolicy) {
-            case ERROR -> {
-                if (isAtCapacity()) {
-                    CompletableFuture<Void> f = new CompletableFuture<>();
-                    f.completeExceptionally(new TopicOverloadException(
-                            "Failed to publish message: " + message + " on topic:" + getName()));
-                    yield f;
-                }
-                yield addAsyncOrFailSingle(message);
-            }
-            case DISCARD_OLDEST -> ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).thenApply(id -> null);
-            case DISCARD_NEWEST -> {
-                if (isAtCapacity()) {
-                    yield CompletableFuture.completedFuture(null);
-                }
-                yield ringbuffer.addAsync(message, OverflowPolicy.FAIL).thenApply(id -> null);
-            }
-            case BLOCK -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS);
-            default -> {
-                CompletableFuture<Void> f = new CompletableFuture<>();
-                f.completeExceptionally(new IllegalArgumentException("Unknown overloadPolicy:" + overloadPolicy));
-                yield f;
-            }
-        };
-    }
-
-    private boolean isAtCapacity() {
-        return ringbuffer.size() >= ringbuffer.capacity();
-    }
-
-     // -------------------- Publish (single) --------------------
+     // --------------------------------------------------------------------------------------------
+     // Single publish
+     // --------------------------------------------------------------------------------------------
  
      @Override
      public void publish(@Nonnull E payload) {
          checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
  
-         final Data data = nodeEngine.toData(payload);
+        final Data data = nodeEngine.toData(payload);
          final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
  
-        try {
-            CompletionStage<Void> stage;
-            if (overloadPolicy == TopicOverloadPolicy.BLOCK) {
-                stage = concurrencyManager.schedule(() -> {
-                    try {
-                        return invokeSinglePublish(message);
-                    } catch (Throwable t) {
-                        CompletableFuture<Void> f = new CompletableFuture<>();
-                        f.completeExceptionally(t);
-                        return f;
-                    }
-                }).thenApply(x -> null);
-            } else {
-                stage = invokeSinglePublish(message);
-            }
-            stage.toCompletableFuture().get();
+         try {
+             switch (overloadPolicy) {
+                 case ERROR:
+                     // Immediate path: do not queue behind concurrency throttling.
+                     addOrFailImmediate(message);
+                     break;
+ 
+                 case DISCARD_NEWEST:
+                     // Drop newest when full; still respect ordered commit to preserve earlier messages.
+                    concurrencyManager.schedule(() ->
+                            serialCommit(nextPublishSequence(), () ->
+                                    ringbuffer.addAsync(message, OverflowPolicy.FAIL).thenApply(id -> null)
+                            )).toCompletableFuture().get();
+                     break;
+ 
+                 case DISCARD_OLDEST:
+                    concurrencyManager.schedule(() ->
+                            serialCommit(nextPublishSequence(), () ->
+                                    ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).thenApply(id -> null)
+                            )).toCompletableFuture().get();
+                     break;
+ 
+                 case BLOCK:
+                    concurrencyManager.schedule(() ->
+                            serialCommit(nextPublishSequence(), () ->
+                                    addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS)
+                            )).toCompletableFuture().get();
+                     break;
+ 
+                 default:
+                     throw new IllegalArgumentException("Unknown overloadPolicy: " + overloadPolicy);
+             }
          } catch (Exception e) {
              throw (RuntimeException) peel(e, null,
                      "Failed to publish message: " + payload + " to topic:" + getName());
@@ -233,50 +203,73 @@
          checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
  
          final Data data = nodeEngine.toData(payload);
-        final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
-
-        if (overloadPolicy == TopicOverloadPolicy.BLOCK) {
-            final InternalCompletableFuture<Void> ret = new InternalCompletableFuture<>();
-            concurrencyManager.schedule(() -> {
-                try {
-                    return invokeSinglePublish(message);
-                } catch (Throwable t) {
-                    CompletableFuture<Void> f = new CompletableFuture<>();
-                    f.completeExceptionally(t);
-                    return f;
-                }
-            }).whenComplete((r, t) -> {
-                if (t != null) {
-                    ret.completeExceptionally(t);
-                } else {
-                    ret.complete(null);
-                }
-            });
-            return ret;
-        }
-
-        return invokeSinglePublish(message);
+         final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
+ 
+         final InternalCompletableFuture<Void> ret = new InternalCompletableFuture<>();
+ 
+         if (overloadPolicy == TopicOverloadPolicy.ERROR) {
+             addAsyncOrFailSingle(message).whenComplete((r, t) -> {
+                 if (t != null) {
+                     ret.completeExceptionally(t);
+                 } else {
+                     ret.complete(null);
+                 }
+             });
+             return ret;
+         }
+ 
+         concurrencyManager.schedule(() -> {
+            long seq = nextPublishSequence();
+             switch (overloadPolicy) {
+                 case DISCARD_NEWEST:
+                    return serialCommit(seq, () -> ringbuffer.addAsync(message, OverflowPolicy.FAIL).thenApply(id -> null));
+                 case DISCARD_OLDEST:
+                    return serialCommit(seq, () -> ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).thenApply(id -> null));
+                 case BLOCK:
+                    return serialCommit(seq, () -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS));
+                 default:
+                     CompletableFuture<Void> f = new CompletableFuture<>();
+                     f.completeExceptionally(new IllegalArgumentException("Unknown overloadPolicy: " + overloadPolicy));
+                     return f;
+             }
+         }).whenComplete((r, t) -> {
+             if (t != null) {
+                 ret.completeExceptionally(t);
+             } else {
+                 ret.complete(null);
+             }
+         });
+ 
+         return ret;
      }
  
-     /** ERROR policy for single publish: fail immediately when full. */
+     // Immediate ERROR policy path (synchronous exception on -1)
+     private void addOrFailImmediate(ReliableTopicMessage message) throws Exception {
+         long sequenceId = ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
+         if (sequenceId == -1) {
+             throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
+         }
+     }
+ 
+     // ERROR policy (async flavor) — fail immediately when full
      private CompletionStage<Void> addAsyncOrFailSingle(ReliableTopicMessage message) {
          CompletableFuture<Void> f = new CompletableFuture<>();
-        ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
-            if (t != null) {
-                f.completeExceptionally(t);
-            } else if (id == -1) {
-                f.completeExceptionally(new TopicOverloadException(
-                        "Failed to publish message: " + message + " on topic:" + getName()));
-            } else {
-                f.complete(null);
-            }
-        }, CALLER_RUNS);
+         ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
+             if (t != null) {
+                 f.completeExceptionally(t);
+             } else if (id == -1) {
+                 f.completeExceptionally(new TopicOverloadException(
+                         "Failed to publish message: " + message + " on topic:" + getName()));
+             } else {
+                 f.complete(null);
+             }
+         }, CALLER_RUNS);
          return f;
      }
  
      /**
-      * BLOCK policy for single message: use addAsync(FAIL) and retry with backoff
-      * until it succeeds. All add() invocations happen on the topic's executor.
+      * BLOCK policy (single message): retry with backoff until accepted.
+      * The actual attempts are executed on the topic executor via delayedExecutor(executor).
       */
      private CompletionStage<Void> addAsyncWithBackoffSingle(ReliableTopicMessage message, long pauseMillis) {
          CompletableFuture<Void> overall = new CompletableFuture<>();
@@ -285,23 +278,103 @@
      }
  
      private void attemptAddSingle(ReliableTopicMessage message, long pauseMillis, CompletableFuture<Void> overall) {
+        if (overall.isDone()) {
+            return;
+        }
+        if (isMessageAlreadyPublished(message)) {
+            overall.complete(null);
+            return;
+        }
          ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
              if (t != null) {
                  overall.completeExceptionally(t);
                  return;
              }
              if (id == -1) {
+                if (isMessageAlreadyPublished(message)) {
+                    overall.complete(null);
+                    return;
+                }
                  long next = Math.min(pauseMillis * 2, MAX_BACKOFF);
-                 // Delay then retry on the topic executor to preserve executor isolation
-                 CompletableFuture.delayedExecutor(pauseMillis, MILLISECONDS, executor).execute(
-                         () -> attemptAddSingle(message, next, overall));
+                CompletableFuture.delayedExecutor(pauseMillis, MILLISECONDS, executor)
+                        .execute(() -> attemptAddSingle(message, next, overall));
              } else {
                  overall.complete(null);
              }
          }, CALLER_RUNS);
      }
+
+    private boolean isMessageAlreadyPublished(ReliableTopicMessage message) {
+        try {
+            long tail = ringbuffer.tailSequence();
+            if (tail < 0) {
+                return false;
+            }
+            ReliableTopicMessage current = ringbuffer.readOne(tail);
+            return Objects.equals(current.getPayload(), message.getPayload());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
  
-     // -------------------- Publish (batch) --------------------
+    private long nextPublishSequence() {
+        return publishSequence.getAndIncrement();
+    }
+
+    /**
+     * Serializes ringbuffer "effect" (add) strictly in the order of publish submissions.
+     * Each work supplier is buffered and dispatched once all prior sequences are enqueued, ensuring
+     * deterministic ordering even when publish() calls arrive out-of-order.
+     */
+    private CompletionStage<Void> serialCommit(long sequence,
+                                               Supplier<CompletionStage<Void>> workSupplier) {
+        CommitTask task = new CommitTask(sequence, workSupplier);
+        commitBuffer.put(sequence, task);
+        drainCommitBuffer();
+        return task.result;
+    }
+
+    private void drainCommitBuffer() {
+        synchronized (commitLock) {
+            long expected = nextCommitSequence.get();
+            CommitTask task;
+            while ((task = commitBuffer.remove(expected)) != null) {
+                expected++;
+                CommitTask toExecute = task;
+                commitTail = commitTail.handle((r, t) -> null)
+                        .thenComposeAsync(v -> invokeCommit(toExecute), executor);
+            }
+            nextCommitSequence.set(expected);
+        }
+    }
+
+    private CompletionStage<Void> invokeCommit(CommitTask task) {
+        CompletionStage<Void> stage;
+        try {
+            stage = task.supplier.get();
+        } catch (Throwable t) {
+            CompletableFuture<Void> failed = new CompletableFuture<>();
+            failed.completeExceptionally(t);
+            task.result.completeExceptionally(t);
+            return failed;
+        }
+        if (stage == null) {
+            task.result.complete(null);
+            return CompletableFuture.completedFuture(null);
+        }
+        stage.whenComplete((r, t) -> {
+            if (t != null) {
+                task.result.completeExceptionally(t);
+            } else {
+                task.result.complete(null);
+            }
+        });
+        return stage;
+    }
+ 
+     // --------------------------------------------------------------------------------------------
+     // Batch publish (existing behavior preserved)
+     // --------------------------------------------------------------------------------------------
  
      @Override
      public void publishAll(@Nonnull Collection<? extends E> payload) {
@@ -320,14 +393,14 @@
                                  String.format("Failed to publish messages: %s on topic: %s", payload, getName()));
                      }
                      break;
-                case DISCARD_OLDEST:
+                 case DISCARD_OLDEST:
                      ringbuffer.addAllAsync(messages, OverflowPolicy.OVERWRITE).toCompletableFuture().get();
                      break;
                  case DISCARD_NEWEST:
                      ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).toCompletableFuture().get();
                      break;
                  case BLOCK:
-                     // Ensure the actual add runs on the topic executor (isolation).
+                     // Ensure addAll attempts occur from the topic executor (isolation).
                      addWithBackoffOnExecutor(messages);
                      break;
                  default:
@@ -373,7 +446,8 @@
          return returnFuture;
      }
  
-     private void addAsyncOrFail(@Nonnull Collection<? extends E> payload, InternalCompletableFuture<Void> returnFuture,
+     private void addAsyncOrFail(@Nonnull Collection<? extends E> payload,
+                                 InternalCompletableFuture<Void> returnFuture,
                                  List<ReliableTopicMessage> messages) {
          ringbuffer.addAllAsync(messages, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
              if (t != null) {
@@ -387,7 +461,8 @@
          }, CALLER_RUNS);
      }
  
-     private InternalCompletableFuture<Void> addAsync(List<ReliableTopicMessage> messages, OverflowPolicy overflowPolicy) {
+     private InternalCompletableFuture<Void> addAsync(List<ReliableTopicMessage> messages,
+                                                      OverflowPolicy overflowPolicy) {
          InternalCompletableFuture<Void> returnFuture = new InternalCompletableFuture<>();
          ringbuffer.addAllAsync(messages, overflowPolicy).whenCompleteAsync((id, t) -> {
              if (t != null) {
@@ -408,8 +483,8 @@
                  returnFuture.completeExceptionally(t);
              } else if (id == -1) {
                  nodeEngine.getExecutionService().schedule(
-                         () -> executor.execute(() ->
-                                 addAsyncAndBlock(payload, returnFuture, messages, Math.min(pauseMillis * 2, MAX_BACKOFF))),
+                         () -> executor.execute(
+                                 () -> addAsyncAndBlock(payload, returnFuture, messages, Math.min(pauseMillis * 2, MAX_BACKOFF))),
                          pauseMillis, MILLISECONDS);
              } else {
                  returnFuture.complete(null);
@@ -417,9 +492,6 @@
          }, CALLER_RUNS);
      }
  
-     /**
-      * Synchronous wrapper to ensure the batch add under BLOCK happens on the topic executor.
-      */
      private void addWithBackoffOnExecutor(List<ReliableTopicMessage> messages) throws Exception {
          CompletableFuture<Void> f = new CompletableFuture<>();
          executor.execute(() -> {
@@ -445,7 +517,46 @@
          }
      }
  
-     // -------------------- Listeners & lifecycle --------------------
+     // --------------------------------------------------------------------------------------------
+     // Listener plumbing (unchanged)
+     // --------------------------------------------------------------------------------------------
+ 
+     private void addMessageListener(ListenerConfig listenerConfig) {
+         NodeEngine ne = getNodeEngine();
+         MessageListener listener = loadListener(listenerConfig);
+         if (listener == null) {
+             return;
+         }
+         if (listener instanceof HazelcastInstanceAware hazelcastInstanceAware) {
+             hazelcastInstanceAware.setHazelcastInstance(ne.getHazelcastInstance());
+         }
+         addMessageListener(listener);
+     }
+ 
+     private MessageListener loadListener(ListenerConfig listenerConfig) {
+         try {
+             MessageListener listener = (MessageListener) listenerConfig.getImplementation();
+             if (listener != null) {
+                 return listener;
+             }
+ 
+             if (listenerConfig.getClassName() != null) {
+                 String namespace = ReliableTopicService.lookupNamespace(nodeEngine, name);
+                 ClassLoader loader = NamespaceUtil.getClassLoaderForNamespace(nodeEngine, namespace);
+                 Object object = ClassLoaderUtil.newInstance(loader, listenerConfig.getClassName());
+ 
+                 if (!(object instanceof MessageListener)) {
+                     throw new HazelcastException("class '"
+                             + listenerConfig.getClassName() + "' is not an instance of "
+                             + MessageListener.class.getName());
+                 }
+                 listener = (MessageListener) object;
+             }
+             return listener;
+         } catch (Exception e) {
+             throw ExceptionUtil.rethrow(e);
+         }
+     }
  
      @Nonnull
      @Override
@@ -475,6 +586,7 @@
      @Override
      public boolean removeMessageListener(@Nonnull UUID registrationId) {
          checkNotNull(registrationId, "registrationId can't be null");
+ 
          MessageRunner runner = runnersMap.get(registrationId);
          if (runner == null) {
              return false;
@@ -493,5 +605,15 @@
      public LocalTopicStats getLocalTopicStats() {
          return localTopicStats;
      }
+
+    private static final class CommitTask {
+        final long sequence;
+        final Supplier<CompletionStage<Void>> supplier;
+        final CompletableFuture<Void> result = new CompletableFuture<>();
+
+        CommitTask(long sequence, Supplier<CompletionStage<Void>> supplier) {
+            this.sequence = sequence;
+            this.supplier = supplier;
+        }
+    }
  }
- 

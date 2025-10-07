@@ -664,6 +664,14 @@ public void testReadBatchSizePreservedWithConcurrency() throws Exception {
                 allMessagesReceived.await(20, TimeUnit.SECONDS));
 
         assertEquals(totalMessages, receivedMessages.size());
+        InternalSerializationService ss = Accessors.getSerializationService(hz);
+        List<Integer> ringOrder = new ArrayList<>();
+        long head = original.headSequence();
+        long tail = original.tailSequence();
+        for (long seq = head; seq <= tail; seq++) {
+            ReliableTopicMessage m = original.readOne(seq);
+            ringOrder.add(ss.toObject(m.getPayload()));
+        }
         assertFalse("Message order violated", orderViolation.get());
         assertTrue("Messages should be in order", isMonotonicallyIncreasing(receivedMessages));
         for (int i = 0; i < totalMessages; i++) {

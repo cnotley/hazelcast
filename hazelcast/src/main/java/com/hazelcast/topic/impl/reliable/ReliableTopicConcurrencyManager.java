@@ -18,48 +18,52 @@
  /**
   * Concurrency manager for reliable topic publishing.
   *
-  * Guarantees:
-  *  - Suppliers are INVOKED strictly in submission order.
-  *  - At most currentLimit() suppliers are in-flight (started but not yet completed).
-  *  - With limit=1, the next supplier doesn't start until the previous completes.
-  *  - schedule(...) never blocks; it returns a CompletionStage that completes with the supplier's outcome.
-  *  - awaitQuiescence(timeout) waits (bounded) until no queued or in-flight tasks remain.
+  * Guarantees
+  * ----------
+  *  • At most currentLimit() tasks are "in flight" (started but not finished).
+  *  • Tasks are STARTED in strict submission order (0,1,2,...) without over-dispatch.
+  *  • With limit=1, tasks are processed strictly one-by-one (full sequential semantics).
+  *  • schedule(...) returns immediately; the returned stage completes with the supplier’s outcome.
+  *  • awaitQuiescence(timeout) waits (bounded) for both queue and in-flight to drain.
   *
-  * The maximum concurrency is read once at construction from {@link ReliableTopicConfig}.
-  * All work executes on the provided executor (or a bounded internal pool in standalone usage).
+  * Notes
+  * -----
+  *  • Actual ordering of ringbuffer effects is enforced in the proxy via a serial commit chain.
+  *    The manager focuses on start-throttling and visibility.
+  *  • All supplier bodies run on the configured executor (or the internal bounded pool if constructed
+  *    with the (config)-only constructor in test harnesses).
   */
  public final class ReliableTopicConcurrencyManager {
  
      private static final int MAX_LIMIT = 8;
-     private static final int MIN_EXEC_THREADS = 1;
  
      private final Executor executor;
      private final int configuredLimit;
  
-     /** Capacity bound: at most 'configuredLimit' tasks in-flight. */
+     /** Capacity bound: at most 'configuredLimit' started tasks. */
      private final Semaphore permits;
  
-     /** In-flight counter for observability and awaitQuiescence(). */
+     /** In-flight counter for observability and quiescence. */
      private final AtomicInteger inFlight = new AtomicInteger();
  
-     /** Submission order tracking. */
-     private final AtomicLong nextSeq = new AtomicLong();
-     private final AtomicLong nextToStart = new AtomicLong();
+     /** Sequence generators to enforce start order. */
+     private final AtomicLong nextSeq = new AtomicLong(0L);
+     private final AtomicLong nextToStart = new AtomicLong(0L);
  
-     /** Pending tasks keyed by sequence. */
+     /** Pending tasks keyed by their sequence. */
      private final ConcurrentHashMap<Long, Task> pending = new ConcurrentHashMap<>();
  
-     /** Epoch to invalidate old tasks on reset (membership/merge). */
-     private final AtomicLong epoch = new AtomicLong(1L);
- 
-     /** Ensure a single dispatcher run at a time. */
+     /** Dispatch guard. */
      private final AtomicBoolean dispatchScheduled = new AtomicBoolean();
  
-     /** Monitor for awaitQuiescence(). */
+     /** Epoch to invalidate previous state on reset (membership/merge). */
+     private final AtomicLong epoch = new AtomicLong(1L);
+ 
+     /** Idle monitor for awaitQuiescence(timeout). */
      private final Object idleMonitor = new Object();
  
      /**
-      * Preferred constructor: proxy passes its effective executor + config.
+      * Preferred constructor: use the executor selected for the topic plus the config (to read the limit).
       */
      public ReliableTopicConcurrencyManager(Executor executor, ReliableTopicConfig config) {
          this.executor = Objects.requireNonNull(executor, "executor");
@@ -68,12 +72,11 @@
      }
  
      /**
-      * Fallback constructor used by tests when no executor is configured:
-      * Creates a bounded daemon pool sized by the limit (1..8) with distinct worker names.
+      * Fallback/test constructor: builds a bounded daemon pool sized by the configured limit (1..8).
       */
      public ReliableTopicConcurrencyManager(ReliableTopicConfig config) {
          int limit = clamp(config != null ? config.getMaxConcurrentPublishes() : 1);
-         int threads = Math.max(MIN_EXEC_THREADS, Math.min(limit, MAX_LIMIT));
+         int threads = limit; // bounded by clamp(..)
  
          final String id = Integer.toHexString(System.identityHashCode(this));
          final AtomicInteger idx = new AtomicInteger(1);
@@ -89,63 +92,75 @@
      }
  
      private static int clamp(int v) {
-         if (v < 1) return 1;
+         if (v < 1) {
+             return 1;
+         }
          return Math.min(v, MAX_LIMIT);
      }
  
-     /** Returns the effective concurrency limit. */
+     /** Public API: returns the effective concurrency limit. */
      public int currentLimit() {
          return configuredLimit;
      }
  
-     /** Package-private snapshot of currently in-flight tasks. */
+     /** Package-private: snapshot of in-flight tasks. */
      int getInFlightCount() {
          return inFlight.get();
      }
  
      /**
-      * Package-private: waits until scheduler is idle or until timeout elapses.
-      * Returns immediately when idle; honors the timeout.
+      * Package-private: bounded wait for the scheduler to go idle.
+      * Returns as soon as there is no pending task and in-flight is 0 or when timeout elapses.
       */
      void awaitQuiescence(Duration timeout) {
-         final long deadlineNanos = System.nanoTime() + (timeout == null ? 0L : timeout.toNanos());
+         long deadline = timeout == null ? 0L : System.nanoTime() + timeout.toNanos();
          synchronized (idleMonitor) {
              for (;;) {
                  if (pending.isEmpty() && inFlight.get() == 0) {
                      return;
                  }
-                 long remaining = deadlineNanos - System.nanoTime();
-                 if (timeout != null && remaining <= 0L) {
-                     return;
-                 }
-                 long waitMillis = timeout == null ? 25L : Math.min(50L, Math.max(1L, remaining / 1_000_000L));
-                 try {
-                     idleMonitor.wait(waitMillis);
-                 } catch (InterruptedException ie) {
-                     Thread.currentThread().interrupt();
-                     return;
+                 if (timeout != null) {
+                     long remaining = deadline - System.nanoTime();
+                     if (remaining <= 0) {
+                         return;
+                     }
+                     long waitMs = Math.max(1L, Math.min(50L, remaining / 1_000_000L));
+                     try {
+                         idleMonitor.wait(waitMs);
+                     } catch (InterruptedException ie) {
+                         Thread.currentThread().interrupt();
+                         return;
+                     }
+                 } else {
+                     try {
+                         idleMonitor.wait(25L);
+                     } catch (InterruptedException ie) {
+                         Thread.currentThread().interrupt();
+                         return;
+                     }
                  }
              }
          }
      }
  
      /**
-      * Package-private: schedules a unit of work. The supplier is INVOKED in strict submission order.
-      * The returned stage completes with the supplier's stage outcome.
+      * Package-private: schedule a supplier.
+      * The supplier will be INVOKED on the configured executor and started in strict submission order,
+      * with at most currentLimit() tasks in-flight at once.
       */
      CompletionStage<?> schedule(Supplier<CompletionStage<?>> supplier) {
          Objects.requireNonNull(supplier, "supplier");
          final long seq = nextSeq.getAndIncrement();
-         final long snap = epoch.get();
+         final long snapEpoch = epoch.get();
          final CompletableFuture<Void> user = new CompletableFuture<>();
-         pending.put(seq, new Task(seq, snap, supplier, user));
+         pending.put(seq, new Task(seq, snapEpoch, supplier, user));
          scheduleDispatch();
          return user;
      }
  
      /**
-      * Resets the scheduler on membership/merge: clears pending, resets counters and permits,
-      * and bumps the epoch so old completions are ignored.
+      * Resets the scheduler state on membership/merge change.
+      * Clears pending, resets counters/permits and wakes any waiters.
       */
      void reset() {
          epoch.incrementAndGet();
@@ -172,43 +187,22 @@
              for (;;) {
                  boolean progressed = false;
  
-                 // Start as many as allowed: strict sequence + capacity.
-                 for (;;) {
-                     if (!permits.tryAcquire()) {
-                         break;
-                     }
+                 // Try to start as many tasks as allowed (strict sequence).
+                 while (permits.tryAcquire()) {
                      final long want = nextToStart.get();
                      final Task task = pending.remove(want);
                      if (task == null) {
+                         // Can't start 'want' yet; release and stop expanding.
                          permits.release();
                          break;
                      }
  
-                     nextToStart.incrementAndGet();
-                     inFlight.incrementAndGet();
-                     progressed = true;
- 
-                     final long startEpoch = task.epochSnapshot;
-                     CompletionStage<?> inner;
-                     try {
-                         inner = task.supplier.get();
-                     } catch (Throwable t) {
-                         completeUser(task, t);
-                         finishOne(startEpoch);
-                         continue;
-                     }
- 
-                     inner.whenComplete((r, t) -> {
-                         if (t != null) {
-                             completeUser(task, t);
-                         } else {
-                             task.user.complete(null);
-                         }
-                         if (startEpoch == epoch.get()) {
-                             finishOne(startEpoch);
-                         }
-                         scheduleDispatch();
-                     });
+                    // We are starting 'want'
+                    nextToStart.incrementAndGet();
+                    inFlight.incrementAndGet();
+                    progressed = true;
+
+                    invokeTask(task);
                  }
  
                  if (!progressed) {
@@ -224,16 +218,41 @@
          }
      }
  
+    private void invokeTask(Task task) {
+        try {
+            CompletionStage<?> inner = task.supplier.get();
+            if (inner == null) {
+                task.user.complete(null);
+                finishOne(task.epochSnapshot);
+                scheduleDispatch();
+                return;
+            }
+            inner.whenComplete((r, t) -> {
+                if (t != null) {
+                    if (t instanceof CompletionException) {
+                        task.user.completeExceptionally(t);
+                    } else {
+                        task.user.completeExceptionally(new CompletionException(t));
+                    }
+                } else {
+                    task.user.complete(null);
+                }
+                finishOne(task.epochSnapshot);
+                scheduleDispatch();
+            });
+        } catch (Throwable th) {
+            task.user.completeExceptionally(th);
+            finishOne(task.epochSnapshot);
+            scheduleDispatch();
+        }
+    }
+
      private void finishOne(long startEpoch) {
          if (startEpoch == epoch.get()) {
              inFlight.decrementAndGet();
              permits.release();
          }
          wakeIfIdle();
-     }
- 
-     private void completeUser(Task task, Throwable t) {
-         task.user.completeExceptionally(t instanceof CompletionException ? t : new CompletionException(t));
      }
  
      private void wakeIfIdle() {
