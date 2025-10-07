@@ -219,6 +219,10 @@
      }
  
     private void invokeTask(Task task) {
+        executor.execute(() -> runTask(task));
+    }
+
+    private void runTask(Task task) {
         try {
             CompletionStage<?> inner = task.supplier.get();
             if (inner == null) {
