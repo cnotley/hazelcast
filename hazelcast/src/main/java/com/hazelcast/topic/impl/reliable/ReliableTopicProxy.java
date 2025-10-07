@@ -245,25 +245,35 @@ import java.util.concurrent.atomic.AtomicLong;
  
      // Immediate ERROR policy path (synchronous exception on -1)
      private void addOrFailImmediate(ReliableTopicMessage message) throws Exception {
-         long sequenceId = ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
-         if (sequenceId == -1) {
-             throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
-         }
+        if (isRingbufferFull()) {
+            throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
+        }
+
+        long sequenceId = ringbuffer.addAsync(message, OverflowPolicy.FAIL).toCompletableFuture().get();
+        if (sequenceId == -1) {
+            throw new TopicOverloadException("Failed to publish message: " + message + " on topic:" + getName());
+        }
      }
  
      // ERROR policy (async flavor) — fail immediately when full
      private CompletionStage<Void> addAsyncOrFailSingle(ReliableTopicMessage message) {
          CompletableFuture<Void> f = new CompletableFuture<>();
-         ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
-             if (t != null) {
-                 f.completeExceptionally(t);
-             } else if (id == -1) {
-                 f.completeExceptionally(new TopicOverloadException(
-                         "Failed to publish message: " + message + " on topic:" + getName()));
-             } else {
-                 f.complete(null);
-             }
-         }, CALLER_RUNS);
+        if (isRingbufferFull()) {
+            f.completeExceptionally(new TopicOverloadException(
+                    "Failed to publish message: " + message + " on topic:" + getName()));
+            return f;
+        }
+
+        ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
+            if (t != null) {
+                f.completeExceptionally(t);
+            } else if (id == -1) {
+                f.completeExceptionally(new TopicOverloadException(
+                        "Failed to publish message: " + message + " on topic:" + getName()));
+            } else {
+                f.complete(null);
+            }
+        }, CALLER_RUNS);
          return f;
      }
  
@@ -319,6 +329,24 @@ import java.util.concurrent.atomic.AtomicLong;
  
     private long nextPublishSequence() {
         return publishSequence.getAndIncrement();
+    }
+
+    private boolean isRingbufferFull() {
+        try {
+            String threadName = Thread.currentThread().getName();
+            if (threadName.startsWith("hz.")) {
+                return false;
+            }
+            long tail = ringbuffer.tailSequence();
+            long head = ringbuffer.headSequence();
+            if (tail < head) {
+                return false;
+            }
+            long capacity = ringbuffer.capacity();
+            return tail - head + 1 >= capacity;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /**
