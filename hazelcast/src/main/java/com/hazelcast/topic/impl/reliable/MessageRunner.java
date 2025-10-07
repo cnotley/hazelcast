@@ -85,6 +85,10 @@ public abstract class MessageRunner<E> implements BiConsumer<ReadResultSet<Relia
         this.sequence = initialSequence;
     }
 
+    long getSequence() {
+        return sequence;
+    }
+
     public void next() {
         if (cancelled) {
             return;

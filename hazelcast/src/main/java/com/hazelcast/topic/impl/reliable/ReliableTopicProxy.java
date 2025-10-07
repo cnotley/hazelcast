@@ -168,17 +168,15 @@ import java.util.concurrent.atomic.AtomicLong;
                      break;
  
                  case DISCARD_NEWEST:
-                     // Drop newest when full; still respect ordered commit to preserve earlier messages.
                     concurrencyManager.schedule(() ->
-                            serialCommit(nextPublishSequence(), () ->
-                                    ringbuffer.addAsync(message, OverflowPolicy.FAIL).thenApply(id -> null)
-                            )).toCompletableFuture().get();
+                            serialCommit(nextPublishSequence(), () -> addOrDropNewest(message)))
+                            .toCompletableFuture().get();
                      break;
  
                  case DISCARD_OLDEST:
-                    concurrencyManager.schedule(() ->
+                   concurrencyManager.schedule(() ->
                             serialCommit(nextPublishSequence(), () ->
-                                    ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).thenApply(id -> null)
+                                    addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE)
                             )).toCompletableFuture().get();
                      break;
  
@@ -222,11 +220,11 @@ import java.util.concurrent.atomic.AtomicLong;
             long seq = nextPublishSequence();
              switch (overloadPolicy) {
                  case DISCARD_NEWEST:
-                    return serialCommit(seq, () -> ringbuffer.addAsync(message, OverflowPolicy.FAIL).thenApply(id -> null));
+                   return serialCommit(seq, () -> addOrDropNewest(message));
                  case DISCARD_OLDEST:
-                    return serialCommit(seq, () -> ringbuffer.addAsync(message, OverflowPolicy.OVERWRITE).thenApply(id -> null));
+                   return serialCommit(seq, () -> addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE));
                  case BLOCK:
-                    return serialCommit(seq, () -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS));
+                   return serialCommit(seq, () -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS));
                  default:
                      CompletableFuture<Void> f = new CompletableFuture<>();
                      f.completeExceptionally(new IllegalArgumentException("Unknown overloadPolicy: " + overloadPolicy));
@@ -264,6 +262,7 @@ import java.util.concurrent.atomic.AtomicLong;
             return f;
         }
 
+        System.err.println("addAsync (block policy) on thread: " + Thread.currentThread().getName());
         ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
             if (t != null) {
                 f.completeExceptionally(t);
@@ -273,7 +272,7 @@ import java.util.concurrent.atomic.AtomicLong;
             } else {
                 f.complete(null);
             }
-        }, CALLER_RUNS);
+        }, executor);
          return f;
      }
  
@@ -286,6 +285,18 @@ import java.util.concurrent.atomic.AtomicLong;
          attemptAddSingle(message, pauseMillis, overall);
          return overall;
      }
+
+    private CompletionStage<Void> addOrDropNewest(ReliableTopicMessage message) {
+        if (isBacklogAtCapacity()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return addAsyncOnExecutor(message, OverflowPolicy.FAIL);
+    }
+
+    private CompletionStage<Void> addAsyncOnExecutor(ReliableTopicMessage message, OverflowPolicy policy) {
+        System.err.println("addAsync invoked on thread: " + Thread.currentThread().getName());
+        return ringbuffer.addAsync(message, policy).thenApplyAsync(id -> null, executor);
+    }
  
      private void attemptAddSingle(ReliableTopicMessage message, long pauseMillis, CompletableFuture<Void> overall) {
         if (overall.isDone()) {
@@ -295,7 +306,14 @@ import java.util.concurrent.atomic.AtomicLong;
             overall.complete(null);
             return;
         }
-         ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
+        if (isBacklogAtCapacity()) {
+            long next = Math.min(pauseMillis * 2, MAX_BACKOFF);
+            CompletableFuture.delayedExecutor(pauseMillis, MILLISECONDS, executor)
+                    .execute(() -> attemptAddSingle(message, next, overall));
+            return;
+        }
+
+        ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
              if (t != null) {
                  overall.completeExceptionally(t);
                  return;
@@ -311,7 +329,7 @@ import java.util.concurrent.atomic.AtomicLong;
              } else {
                  overall.complete(null);
              }
-         }, CALLER_RUNS);
+        }, executor);
      }
 
     private boolean isMessageAlreadyPublished(ReliableTopicMessage message) {
@@ -332,21 +350,49 @@ import java.util.concurrent.atomic.AtomicLong;
     }
 
     private boolean isRingbufferFull() {
+        return isBacklogAtCapacity();
+    }
+
+    private boolean isBacklogAtCapacity() {
+        long capacity;
         try {
-            String threadName = Thread.currentThread().getName();
-            if (threadName.startsWith("hz.")) {
-                return false;
-            }
-            long tail = ringbuffer.tailSequence();
-            long head = ringbuffer.headSequence();
-            if (tail < head) {
-                return false;
-            }
-            long capacity = ringbuffer.capacity();
-            return tail - head + 1 >= capacity;
+            capacity = ringbuffer.capacity();
         } catch (Throwable ignored) {
             return false;
         }
+        if (capacity <= 0) {
+            return false;
+        }
+
+        long slowestSequence = getSlowestListenerSequence();
+        if (slowestSequence == Long.MAX_VALUE) {
+            return false;
+        }
+
+        long tail;
+        try {
+            tail = ringbuffer.tailSequence();
+        } catch (Throwable ignored) {
+            return false;
+        }
+
+        if (tail < slowestSequence) {
+            return false;
+        }
+
+        long backlog = tail - slowestSequence + 1;
+        return backlog >= capacity;
+    }
+
+    private long getSlowestListenerSequence() {
+        long min = Long.MAX_VALUE;
+        for (MessageRunner<E> runner : runnersMap.values()) {
+            long seq = runner.getSequence();
+            if (seq < min) {
+                min = seq;
+            }
+        }
+        return min;
     }
 
     /**
