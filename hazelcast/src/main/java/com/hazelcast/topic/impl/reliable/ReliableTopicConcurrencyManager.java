@@ -219,7 +219,7 @@
      }
  
     private void invokeTask(Task task) {
-        executor.execute(() -> runTask(task));
+        runTask(task);
     }
 
     private void runTask(Task task) {

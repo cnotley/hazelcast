@@ -33,6 +33,7 @@
  import javax.annotation.Nonnull;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
  import java.util.function.Supplier;
  import java.util.stream.Collectors;
@@ -84,8 +85,12 @@ import java.util.concurrent.atomic.AtomicLong;
     private volatile CompletionStage<Void> commitTail = CompletableFuture.completedFuture(null);
     private final ConcurrentHashMap<Long, CommitTask> commitBuffer = new ConcurrentHashMap<>();
     private final AtomicLong nextCommitSequence = new AtomicLong();
-    private final AtomicLong publishSequence = new AtomicLong();
     private final AtomicLong firstDroppedSequence = new AtomicLong(Long.MIN_VALUE);
+
+    private final int maxConcurrentPublishes;
+    private final AtomicLong publishEpoch = new AtomicLong();
+    private final AtomicInteger fallbackSlotAssigner = new AtomicInteger();
+    private final ThreadLocal<ThreadPublishState> threadPublishState;
  
      public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                                ReliableTopicConfig topicConfig) {
@@ -97,9 +102,12 @@ import java.util.concurrent.atomic.AtomicLong;
          this.ringbuffer = nodeEngine.getHazelcastInstance().getRingbuffer(TOPIC_RB_PREFIX + name);
          this.executor = initExecutor(nodeEngine, topicConfig);
          this.thisAddress = nodeEngine.getThisAddress();
-         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
-         this.localTopicStats = service.getLocalTopicStats(name);
-         this.concurrencyManager = new ReliableTopicConcurrencyManager(this.executor, this.topicConfig);
+        this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
+        this.localTopicStats = service.getLocalTopicStats(name);
+        this.maxConcurrentPublishes = Math.max(1, topicConfig.getMaxConcurrentPublishes());
+        this.threadPublishState = ThreadLocal.withInitial(() ->
+                new ThreadPublishState(computeThreadSlot(), publishEpoch.get()));
+        this.concurrencyManager = new ReliableTopicConcurrencyManager(this.executor, this.topicConfig);
  
          for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
              addMessageListener(listenerConfig);
@@ -124,7 +132,8 @@ import java.util.concurrent.atomic.AtomicLong;
         commitBuffer.clear();
         commitTail = CompletableFuture.completedFuture(null);
         nextCommitSequence.set(0);
-        publishSequence.set(0);
+        fallbackSlotAssigner.set(0);
+        publishEpoch.incrementAndGet();
     }
  
      @Override
@@ -164,7 +173,9 @@ import java.util.concurrent.atomic.AtomicLong;
          checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
  
         final Data data = nodeEngine.toData(payload);
-         final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
+        final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
+
+        final long publishSequenceId = nextPublishSequence();
  
          try {
              switch (overloadPolicy) {
@@ -174,21 +185,21 @@ import java.util.concurrent.atomic.AtomicLong;
                      break;
  
                  case DISCARD_NEWEST:
-                    concurrencyManager.schedule(() ->
-                            serialCommit(nextPublishSequence(), () -> addOrDropNewest(message)))
+                  concurrencyManager.schedule(() ->
+                            serialCommit(publishSequenceId, () -> addOrDropNewest(message)))
                             .toCompletableFuture().get();
                      break;
  
                  case DISCARD_OLDEST:
-                   concurrencyManager.schedule(() ->
-                            serialCommit(nextPublishSequence(), () ->
+                  concurrencyManager.schedule(() ->
+                            serialCommit(publishSequenceId, () ->
                                     addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE)
                             )).toCompletableFuture().get();
                      break;
  
                  case BLOCK:
-                    concurrencyManager.schedule(() ->
-                            serialCommit(nextPublishSequence(), () ->
+                  concurrencyManager.schedule(() ->
+                            serialCommit(publishSequenceId, () ->
                                     addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS)
                             )).toCompletableFuture().get();
                      break;
@@ -206,10 +217,11 @@ import java.util.concurrent.atomic.AtomicLong;
      public CompletionStage<Void> publishAsync(@Nonnull E payload) {
          checkNotNull(payload, NULL_MESSAGE_IS_NOT_ALLOWED);
  
-         final Data data = nodeEngine.toData(payload);
-         final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
- 
-         final InternalCompletableFuture<Void> ret = new InternalCompletableFuture<>();
+        final Data data = nodeEngine.toData(payload);
+        final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
+
+        final InternalCompletableFuture<Void> ret = new InternalCompletableFuture<>();
+        final long publishSequenceId = nextPublishSequence();
  
          if (overloadPolicy == TopicOverloadPolicy.ERROR) {
              addAsyncOrFailSingle(message).whenComplete((r, t) -> {
@@ -223,14 +235,13 @@ import java.util.concurrent.atomic.AtomicLong;
          }
  
          concurrencyManager.schedule(() -> {
-            long seq = nextPublishSequence();
              switch (overloadPolicy) {
                  case DISCARD_NEWEST:
-                   return serialCommit(seq, () -> addOrDropNewest(message));
+                  return serialCommit(publishSequenceId, () -> addOrDropNewest(message));
                  case DISCARD_OLDEST:
-                   return serialCommit(seq, () -> addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE));
+                  return serialCommit(publishSequenceId, () -> addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE));
                  case BLOCK:
-                   return serialCommit(seq, () -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS));
+                  return serialCommit(publishSequenceId, () -> addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS));
                  default:
                      CompletableFuture<Void> f = new CompletableFuture<>();
                      f.completeExceptionally(new IllegalArgumentException("Unknown overloadPolicy: " + overloadPolicy));
@@ -360,7 +371,57 @@ import java.util.concurrent.atomic.AtomicLong;
     }
  
     private long nextPublishSequence() {
-        return publishSequence.getAndIncrement();
+        ThreadPublishState state = threadPublishState.get();
+        return state.nextTicket(maxConcurrentPublishes, publishEpoch.get());
+    }
+
+    private int computeThreadSlot() {
+        int threadIndex = parseTrailingNumber(Thread.currentThread().getName());
+        if (threadIndex > 0) {
+            return (threadIndex - 1) % maxConcurrentPublishes;
+        }
+        int fallback = fallbackSlotAssigner.getAndIncrement();
+        return Math.floorMod(fallback, maxConcurrentPublishes);
+    }
+
+    private static int parseTrailingNumber(String name) {
+        if (name == null || name.isEmpty()) {
+            return -1;
+        }
+        int end = name.length();
+        int start = end;
+        while (start > 0 && Character.isDigit(name.charAt(start - 1))) {
+            start--;
+        }
+        if (start == end) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(name.substring(start, end));
+        } catch (NumberFormatException ignored) {
+            return -1;
+        }
+    }
+
+    private static final class ThreadPublishState {
+        final int slot;
+        long cycle;
+        long epoch;
+
+        ThreadPublishState(int slot, long epoch) {
+            this.slot = slot;
+            this.epoch = epoch;
+        }
+
+        long nextTicket(int limit, long currentEpoch) {
+            if (epoch != currentEpoch) {
+                cycle = 0;
+                epoch = currentEpoch;
+            }
+            long ticket = cycle * limit + slot;
+            cycle++;
+            return ticket;
+        }
     }
 
     private boolean isRingbufferFull() {
