@@ -33,7 +33,6 @@
  import javax.annotation.Nonnull;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
  import java.util.function.Supplier;
  import java.util.stream.Collectors;
@@ -87,10 +86,7 @@ import java.util.concurrent.atomic.AtomicLong;
     private final AtomicLong nextCommitSequence = new AtomicLong();
     private final AtomicLong firstDroppedSequence = new AtomicLong(Long.MIN_VALUE);
 
-    private final int maxConcurrentPublishes;
-    private final AtomicLong publishEpoch = new AtomicLong();
-    private final AtomicInteger fallbackSlotAssigner = new AtomicInteger();
-    private final ThreadLocal<ThreadPublishState> threadPublishState;
+    private final AtomicLong publishSequence = new AtomicLong();
  
      public ReliableTopicProxy(String name, NodeEngine nodeEngine, ReliableTopicService service,
                                ReliableTopicConfig topicConfig) {
@@ -104,9 +100,6 @@ import java.util.concurrent.atomic.AtomicLong;
          this.thisAddress = nodeEngine.getThisAddress();
         this.overloadPolicy = topicConfig.getTopicOverloadPolicy();
         this.localTopicStats = service.getLocalTopicStats(name);
-        this.maxConcurrentPublishes = Math.max(1, topicConfig.getMaxConcurrentPublishes());
-        this.threadPublishState = ThreadLocal.withInitial(() ->
-                new ThreadPublishState(computeThreadSlot(), publishEpoch.get()));
         this.concurrencyManager = new ReliableTopicConcurrencyManager(this.executor, this.topicConfig);
  
          for (ListenerConfig listenerConfig : topicConfig.getMessageListenerConfigs()) {
@@ -132,8 +125,7 @@ import java.util.concurrent.atomic.AtomicLong;
         commitBuffer.clear();
         commitTail = CompletableFuture.completedFuture(null);
         nextCommitSequence.set(0);
-        fallbackSlotAssigner.set(0);
-        publishEpoch.incrementAndGet();
+        publishSequence.set(0);
     }
  
      @Override
@@ -371,57 +363,7 @@ import java.util.concurrent.atomic.AtomicLong;
     }
  
     private long nextPublishSequence() {
-        ThreadPublishState state = threadPublishState.get();
-        return state.nextTicket(maxConcurrentPublishes, publishEpoch.get());
-    }
-
-    private int computeThreadSlot() {
-        int threadIndex = parseTrailingNumber(Thread.currentThread().getName());
-        if (threadIndex > 0) {
-            return (threadIndex - 1) % maxConcurrentPublishes;
-        }
-        int fallback = fallbackSlotAssigner.getAndIncrement();
-        return Math.floorMod(fallback, maxConcurrentPublishes);
-    }
-
-    private static int parseTrailingNumber(String name) {
-        if (name == null || name.isEmpty()) {
-            return -1;
-        }
-        int end = name.length();
-        int start = end;
-        while (start > 0 && Character.isDigit(name.charAt(start - 1))) {
-            start--;
-        }
-        if (start == end) {
-            return -1;
-        }
-        try {
-            return Integer.parseInt(name.substring(start, end));
-        } catch (NumberFormatException ignored) {
-            return -1;
-        }
-    }
-
-    private static final class ThreadPublishState {
-        final int slot;
-        long cycle;
-        long epoch;
-
-        ThreadPublishState(int slot, long epoch) {
-            this.slot = slot;
-            this.epoch = epoch;
-        }
-
-        long nextTicket(int limit, long currentEpoch) {
-            if (epoch != currentEpoch) {
-                cycle = 0;
-                epoch = currentEpoch;
-            }
-            long ticket = cycle * limit + slot;
-            cycle++;
-            return ticket;
-        }
+        return publishSequence.getAndIncrement();
     }
 
     private boolean isRingbufferFull() {

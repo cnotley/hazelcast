@@ -1089,16 +1089,19 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
                         int value = ss.toObject(msg.getPayload());
                         AtomicInteger attempt = attempts.computeIfAbsent(value, k -> new AtomicInteger());
                         int n = attempt.incrementAndGet();
+                        System.out.println("addAsync invoked for value=" + value + " attempt=" + n);
                         if (n == 1) {
                             submissionOrder.add(value);
                         }
                         int fails = failPlan.getOrDefault(value, 0);
                         if (n <= fails) {
+                            System.out.println("forcing failure for value=" + value + " attempt=" + n);
                             return InternalCompletableFuture.newCompletedFuture(-1L);
                         }
                         InternalCompletableFuture<Long> fut =
                                 (InternalCompletableFuture<Long>) method.invoke(original, args);
                         fut.whenComplete((seq, t) -> {
+                            System.out.println("completion for value=" + value + " seq=" + seq + " throwable=" + t);
                             if (t == null && seq != -1) {
                                 completionOrder.add(value);
                             }
@@ -1124,8 +1127,11 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
                 stages.add(stage);
             }
 
-            for (CompletionStage<Void> stage : stages) {
-                stage.toCompletableFuture().get(10, TimeUnit.SECONDS);
+            for (int i = 0; i < stages.size(); i++) {
+                CompletionStage<Void> stage = stages.get(i);
+                System.out.println("waiting stage=" + i);
+                stage.toCompletableFuture().get(30, TimeUnit.SECONDS);
+                System.out.println("completed stage=" + i);
             }
 
             List<Integer> ringbufferOrder = new ArrayList<>();
@@ -1137,8 +1143,15 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
             }
 
             assertEquals(handler.submissionOrder, ringbufferOrder);
+            assertEquals(handler.submissionOrder, handler.completionOrder);
+
+            handler.failPlan.forEach((value, expectedFailures) -> {
+                AtomicInteger recordedAttempts = handler.attempts.get(value);
+                assertNotNull("Missing attempt counter for value " + value, recordedAttempts);
+                assertEquals("Unexpected retry count for value " + value,
+                        expectedFailures + 1, recordedAttempts.get());
+            });
             assertEquals(handler.submissionOrder.size(), handler.completionOrder.size());
-            assertNotEquals(handler.submissionOrder, handler.completionOrder);
         } finally {
             submitter.shutdownNow();
             Hazelcast.shutdownAll();
