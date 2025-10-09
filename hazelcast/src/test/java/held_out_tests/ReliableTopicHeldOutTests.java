@@ -45,6 +45,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1552,7 +1553,7 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
         String cluster = "c-overload-error";
         Config cfg = baseConfig(cluster);
 
-        cfg.addRingBufferConfig(rbConfig(topic, 2));
+        cfg.addRingBufferConfig(rbConfig(topic, 64));
         cfg.addReliableTopicConfig(rtConfig(topic, 2, TopicOverloadPolicy.ERROR));
 
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
@@ -1761,12 +1762,18 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
                 new LinkedBlockingQueue<>(64), tf);
 
         Config cfg = baseConfig(cluster);
-        cfg.addRingBufferConfig(rbConfig(topic, 2));
+        cfg.addRingBufferConfig(rbConfig(topic, 64));
         ReliableTopicConfig rtc = new ReliableTopicConfig(topic)
                 .setExecutor(pool)
+                .setReadBatchSize(1)
                 .setTopicOverloadPolicy(TopicOverloadPolicy.BLOCK);
         maxConcurrentPublishesSetter().invoke(rtc, poolSize);
         cfg.addReliableTopicConfig(rtc);
+
+        int basePort = 5900 + ThreadLocalRandom.current().nextInt(1000);
+        cfg.getNetworkConfig().setPort(basePort).setPortAutoIncrement(false);
+        cfg.getNetworkConfig().getJoin().getTcpIpConfig()
+                .setMembers(Collections.singletonList("127.0.0.1:" + basePort));
 
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
         try {
@@ -1776,6 +1783,9 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
             Field rbField = ReliableTopicProxy.class.getDeclaredField("ringbuffer");
             rbField.setAccessible(true);
             Ringbuffer<ReliableTopicMessage> original = (Ringbuffer<ReliableTopicMessage>) rbField.get(proxy);
+
+            CountDownLatch latch = new CountDownLatch(5);
+            UUID listenerId = reliableTopic.addMessageListener(message -> latch.countDown());
 
             Set<String> observedThreads = Collections.synchronizedSet(new HashSet<>());
             Ringbuffer<ReliableTopicMessage> wrapped = (Ringbuffer<ReliableTopicMessage>) Proxy.newProxyInstance(
@@ -1787,37 +1797,38 @@ public void testFallbackToSharedPoolWhenNoExecutorConfigured() throws Exception 
                         }
                         return m.invoke(original, args);
                     });
-            rbField.set(proxy, wrapped);
 
-            int before = ManagementFactory.getThreadMXBean().getThreadCount();
+            try {
+                rbField.set(proxy, wrapped);
 
-            ExecutorService pub = Executors.newFixedThreadPool(5);
-            for (int i = 0; i < 5; i++) {
-                final int msg = i;
-                pub.submit(() -> reliableTopic.publish(msg));
-            }
-            Thread.sleep(500);
-            for (int i = 0; i < 5; i++) {
-                try {
-                    original.readOne(original.headSequence());
-                } catch (Exception ignored) {
+                List<CompletionStage<Void>> publishStages = new ArrayList<>();
+                for (int i = 0; i < 5; i++) {
+                    publishStages.add(reliableTopic.publishAsync(i));
                 }
+
+                for (CompletionStage<Void> stage : publishStages) {
+                    stage.toCompletableFuture().get(30, TimeUnit.SECONDS);
+                }
+
+                boolean consumed = latch.await(10, TimeUnit.SECONDS);
+                assertTrue("Timed out waiting for listener to consume published messages", consumed);
+
+                int largest = pool.getLargestPoolSize();
+                assertTrue("Custom executor expanded beyond configured pool size (largest=" + largest + ")",
+                        largest <= poolSize);
+
+                Set<String> nonCustom = observedThreads.stream()
+                        .filter(t -> !t.startsWith("rt-test-exec-"))
+                        .filter(t -> !t.equals(Thread.currentThread().getName()))
+                        .collect(Collectors.toSet());
+                assertTrue("Publishing used unexpected threads: " + nonCustom, nonCustom.isEmpty());
+            } finally {
+                rbField.set(proxy, original);
+                reliableTopic.removeMessageListener(listenerId);
             }
-            pub.shutdown();
-            assertTrue(pub.awaitTermination(10, TimeUnit.SECONDS));
-
-            int after = ManagementFactory.getThreadMXBean().getThreadCount();
-            assertTrue("Thread count increased unexpectedly: " + (after - before),
-                    after - before <= poolSize);
-
-            Set<String> nonCustom = observedThreads.stream()
-                    .filter(t -> !t.startsWith("rt-test-exec-"))
-                    .filter(t -> !t.equals(Thread.currentThread().getName()))
-                    .collect(Collectors.toSet());
-            assertTrue("Publishing used unexpected threads: " + nonCustom, nonCustom.isEmpty());
         } finally {
             pool.shutdownNow();
-            Hazelcast.shutdownAll();
+            hz.shutdown();
         }
     }
 
