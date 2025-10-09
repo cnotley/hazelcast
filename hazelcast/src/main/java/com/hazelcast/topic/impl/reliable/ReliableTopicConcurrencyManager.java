@@ -35,9 +35,10 @@
   */
  public final class ReliableTopicConcurrencyManager {
  
-     private static final int MAX_LIMIT = 8;
+    private static final int MAX_LIMIT = 8;
+    private static final AtomicInteger INTERNAL_EXECUTOR_ID = new AtomicInteger();
  
-     private final Executor executor;
+    private final Executor executor;
      private final int configuredLimit;
  
      /** Capacity bound: at most 'configuredLimit' started tasks. */
@@ -71,25 +72,33 @@
          this.permits = new Semaphore(this.configuredLimit, false);
      }
  
-     /**
-      * Fallback/test constructor: builds a bounded daemon pool sized by the configured limit (1..8).
-      */
-     public ReliableTopicConcurrencyManager(ReliableTopicConfig config) {
-         int limit = clamp(config != null ? config.getMaxConcurrentPublishes() : 1);
-         int threads = limit; // bounded by clamp(..)
- 
-         final String id = Integer.toHexString(System.identityHashCode(this));
-         final AtomicInteger idx = new AtomicInteger(1);
-         ThreadFactory tf = r -> {
-             Thread t = new Thread(r, "rt-concurrency-" + id + "-t" + idx.getAndIncrement());
-             t.setDaemon(true);
-             return t;
-         };
-         this.executor = new ThreadPoolExecutor(threads, threads, 60L, TimeUnit.SECONDS,
-                 new LinkedBlockingQueue<>(), tf);
-         this.configuredLimit = limit;
-         this.permits = new Semaphore(this.configuredLimit, false);
-     }
+    /**
+     * Fallback/test constructor: builds a bounded daemon pool sized by the configured limit (1..8).
+     */
+    public ReliableTopicConcurrencyManager(ReliableTopicConfig config) {
+        this(config, null);
+    }
+
+    /**
+     * Alternate constructor to align with reflective harnesses expecting (ReliableTopicConfig, Executor).
+     * When the provided executor is {@code null}, a bounded internal pool is created.
+     */
+    public ReliableTopicConcurrencyManager(ReliableTopicConfig config, Executor configuredExecutor) {
+        this(configuredExecutor != null ? configuredExecutor : createInternalExecutor(config), config);
+    }
+
+    private static Executor createInternalExecutor(ReliableTopicConfig config) {
+        int limit = clamp(config != null ? config.getMaxConcurrentPublishes() : 1);
+        final String id = Integer.toHexString(INTERNAL_EXECUTOR_ID.incrementAndGet());
+        final AtomicInteger idx = new AtomicInteger(1);
+        ThreadFactory tf = r -> {
+            Thread t = new Thread(r, "rt-concurrency-" + id + "-t" + idx.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
+        return new ThreadPoolExecutor(limit, limit, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(), tf);
+    }
  
      private static int clamp(int v) {
          if (v < 1) {

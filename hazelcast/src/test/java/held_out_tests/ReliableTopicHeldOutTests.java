@@ -22,7 +22,9 @@ import com.hazelcast.topic.impl.reliable.ReliableTopicMessage;
 import com.hazelcast.topic.impl.reliable.ReliableTopicProxy;
 import com.hazelcast.spi.impl.InternalCompletableFuture;
 
+import org.junit.After;
 import org.junit.Assume;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.lang.reflect.InvocationHandler;
@@ -55,6 +57,22 @@ import javax.management.ObjectName;
 import static org.junit.Assert.*;
 
 public class ReliableTopicHeldOutTests {
+    private static final long TEST_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(60);
+
+    private long testStartNanos;
+
+    @Before
+    public void startTestTimer() {
+        testStartNanos = System.nanoTime();
+    }
+
+    @After
+    public void enforceTestTimeout() {
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - testStartNanos);
+        if (elapsedMillis > TEST_TIMEOUT_MILLIS) {
+            fail("Test exceeded 60 seconds (elapsed=" + elapsedMillis + " ms)");
+        }
+    }
     private static final String MANAGER_FQN = "com.hazelcast.topic.impl.reliable.ReliableTopicConcurrencyManager";
     private static final String PROXY_FQN   = "com.hazelcast.topic.impl.reliable.ReliableTopicProxy";
 
