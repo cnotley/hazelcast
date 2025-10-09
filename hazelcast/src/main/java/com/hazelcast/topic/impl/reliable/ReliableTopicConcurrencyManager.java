@@ -219,11 +219,7 @@
      }
  
     private void invokeTask(Task task) {
-        try {
-            executor.execute(() -> runTask(task));
-        } catch (RejectedExecutionException rex) {
-            runTask(task);
-        }
+        runTask(task);
     }
 
     private void runTask(Task task) {
