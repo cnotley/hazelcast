@@ -33,6 +33,7 @@
  import javax.annotation.Nonnull;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
  import java.util.function.Supplier;
  import java.util.stream.Collectors;
@@ -80,9 +81,8 @@ import java.util.concurrent.atomic.AtomicLong;
       * Serial commit chain to guarantee that ringbuffer adds are performed in exact submission order.
       * Each publish (except ERROR policy) composes its "work" onto this chain.
       */
-    private final Object commitLock = new Object();
-    private volatile CompletionStage<Void> commitTail = CompletableFuture.completedFuture(null);
-    private final ConcurrentHashMap<Long, CommitTask> commitBuffer = new ConcurrentHashMap<>();
+    private final ConcurrentSkipListMap<Long, CommitTask> commitQueue = new ConcurrentSkipListMap<>();
+    private final AtomicBoolean commitDraining = new AtomicBoolean();
     private final AtomicLong nextCommitSequence = new AtomicLong();
     private final AtomicLong firstDroppedSequence = new AtomicLong(Long.MIN_VALUE);
 
@@ -122,8 +122,8 @@ import java.util.concurrent.atomic.AtomicLong;
  
     private void resetSchedulingState() {
         concurrencyManager.reset();
-        commitBuffer.clear();
-        commitTail = CompletableFuture.completedFuture(null);
+        commitQueue.clear();
+        commitDraining.set(false);
         nextCommitSequence.set(0);
         publishSequence.set(0);
     }
@@ -166,31 +166,31 @@ import java.util.concurrent.atomic.AtomicLong;
  
         final Data data = nodeEngine.toData(payload);
         final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
-
-        final long publishSequenceId = nextPublishSequence();
  
+        final long publishSequenceId = nextPublishSequence();
          try {
              switch (overloadPolicy) {
                  case ERROR:
-                     // Immediate path: do not queue behind concurrency throttling.
-                     addOrFailImmediate(message);
+                    concurrencyManager.schedule(() ->
+                            serialCommit(publishSequenceId, () -> addAsyncOrFailSingle(message))
+                    ).toCompletableFuture().get();
                      break;
  
                  case DISCARD_NEWEST:
-                  concurrencyManager.schedule(() ->
+                    concurrencyManager.schedule(() ->
                             serialCommit(publishSequenceId, () -> addOrDropNewest(message)))
                             .toCompletableFuture().get();
                      break;
  
                  case DISCARD_OLDEST:
-                  concurrencyManager.schedule(() ->
+                    concurrencyManager.schedule(() ->
                             serialCommit(publishSequenceId, () ->
                                     addAsyncOnExecutor(message, OverflowPolicy.OVERWRITE)
                             )).toCompletableFuture().get();
                      break;
  
                  case BLOCK:
-                  concurrencyManager.schedule(() ->
+                    concurrencyManager.schedule(() ->
                             serialCommit(publishSequenceId, () ->
                                     addAsyncWithBackoffSingle(message, INITIAL_BACKOFF_MS)
                             )).toCompletableFuture().get();
@@ -213,7 +213,6 @@ import java.util.concurrent.atomic.AtomicLong;
         final ReliableTopicMessage message = new ReliableTopicMessage(data, thisAddress);
 
         final InternalCompletableFuture<Void> ret = new InternalCompletableFuture<>();
-        final long publishSequenceId = nextPublishSequence();
  
          if (overloadPolicy == TopicOverloadPolicy.ERROR) {
              addAsyncOrFailSingle(message).whenComplete((r, t) -> {
@@ -226,7 +225,9 @@ import java.util.concurrent.atomic.AtomicLong;
              return ret;
          }
  
-         concurrencyManager.schedule(() -> {
+        final long publishSequenceId = nextPublishSequence();
+
+        concurrencyManager.schedule(() -> {
              switch (overloadPolicy) {
                  case DISCARD_NEWEST:
                   return serialCommit(publishSequenceId, () -> addOrDropNewest(message));
@@ -271,7 +272,6 @@ import java.util.concurrent.atomic.AtomicLong;
             return f;
         }
 
-        System.err.println("addAsync (block policy) on thread: " + Thread.currentThread().getName());
         ringbuffer.addAsync(message, OverflowPolicy.FAIL).whenCompleteAsync((id, t) -> {
             if (t != null) {
                 f.completeExceptionally(t);
@@ -307,12 +307,12 @@ import java.util.concurrent.atomic.AtomicLong;
                 ? waitForListenerRecoveryIfNeeded()
                 : CompletableFuture.completedFuture(null);
 
-        return waitStage.thenCompose(v -> ringbuffer.addAsync(message, policy).thenApplyAsync(id -> {
+        return waitStage.thenCompose(v -> ringbuffer.addAsync(message, policy).thenApply(id -> {
             if (policy == OverflowPolicy.OVERWRITE) {
                 recordFirstDroppedSequence(id);
             }
             return null;
-        }, executor));
+        }));
     }
  
      private void attemptAddSingle(ReliableTopicMessage message, long pauseMillis, CompletableFuture<Void> overall) {
@@ -340,7 +340,7 @@ import java.util.concurrent.atomic.AtomicLong;
                     overall.complete(null);
                     return;
                 }
-                 long next = Math.min(pauseMillis * 2, MAX_BACKOFF);
+                long next = Math.min(pauseMillis * 2, MAX_BACKOFF);
                 CompletableFuture.delayedExecutor(pauseMillis, MILLISECONDS, executor)
                         .execute(() -> attemptAddSingle(message, next, overall));
              } else {
@@ -379,6 +379,12 @@ import java.util.concurrent.atomic.AtomicLong;
         }
         if (capacity <= 0) {
             return false;
+        }
+
+        int concurrencyLimit = concurrencyManager != null ? concurrencyManager.currentLimit() : 0;
+        if ((overloadPolicy == TopicOverloadPolicy.ERROR || overloadPolicy == TopicOverloadPolicy.BLOCK)
+                && concurrencyLimit > 0 && concurrencyLimit < capacity) {
+            capacity = concurrencyLimit;
         }
 
         long slowestSequence = getSlowestListenerSequence();
@@ -420,47 +426,55 @@ import java.util.concurrent.atomic.AtomicLong;
     private CompletionStage<Void> serialCommit(long sequence,
                                                Supplier<CompletionStage<Void>> workSupplier) {
         CommitTask task = new CommitTask(sequence, workSupplier);
-        commitBuffer.put(sequence, task);
-        drainCommitBuffer();
+        commitQueue.put(sequence, task);
+        triggerCommitDrain();
         return task.result;
     }
 
-    private void drainCommitBuffer() {
-        synchronized (commitLock) {
-            long expected = nextCommitSequence.get();
-            CommitTask task;
-            while ((task = commitBuffer.remove(expected)) != null) {
-                expected++;
-                CommitTask toExecute = task;
-                commitTail = commitTail.handle((r, t) -> null)
-                        .thenComposeAsync(v -> invokeCommit(toExecute), executor);
-            }
-            nextCommitSequence.set(expected);
+    private void triggerCommitDrain() {
+        if (commitDraining.compareAndSet(false, true)) {
+            executor.execute(this::drainCommitQueue);
         }
     }
 
-    private CompletionStage<Void> invokeCommit(CommitTask task) {
-        CompletionStage<Void> stage;
-        try {
-            stage = task.supplier.get();
-        } catch (Throwable t) {
-            CompletableFuture<Void> failed = new CompletableFuture<>();
-            failed.completeExceptionally(t);
-            task.result.completeExceptionally(t);
-            return failed;
-        }
-        if (stage == null) {
-            task.result.complete(null);
-            return CompletableFuture.completedFuture(null);
-        }
-        stage.whenComplete((r, t) -> {
-            if (t != null) {
-                task.result.completeExceptionally(t);
-            } else {
-                task.result.complete(null);
+    private void drainCommitQueue() {
+        for (;;) {
+            long expected = nextCommitSequence.get();
+            CommitTask task = commitQueue.remove(expected);
+            if (task == null) {
+                commitDraining.set(false);
+                if (!commitQueue.isEmpty() && commitDraining.compareAndSet(false, true)) {
+                    continue;
+                }
+                return;
             }
-        });
-        return stage;
+
+            CompletionStage<Void> stage;
+            try {
+                stage = task.supplier.get();
+            } catch (Throwable t) {
+                task.result.completeExceptionally(t);
+                nextCommitSequence.incrementAndGet();
+                continue;
+            }
+
+            if (stage == null) {
+                task.result.complete(null);
+                nextCommitSequence.incrementAndGet();
+                continue;
+            }
+
+            stage.whenComplete((r, t) -> {
+                if (t != null) {
+                    task.result.completeExceptionally(t);
+                } else {
+                    task.result.complete(null);
+                }
+                nextCommitSequence.incrementAndGet();
+                drainCommitQueue();
+            });
+            return;
+        }
     }
  
      // --------------------------------------------------------------------------------------------

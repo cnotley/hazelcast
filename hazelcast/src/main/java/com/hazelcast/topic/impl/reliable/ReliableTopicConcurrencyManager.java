@@ -228,7 +228,13 @@
      }
  
     private void invokeTask(Task task) {
-        runTask(task);
+        try {
+            executor.execute(() -> runTask(task));
+        } catch (RejectedExecutionException rex) {
+            task.user.completeExceptionally(rex);
+            finishOne(task.epochSnapshot);
+            scheduleDispatch();
+        }
     }
 
     private void runTask(Task task) {
